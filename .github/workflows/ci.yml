@@ -31,11 +31,32 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
+      # Pin an Xcode 26.x toolchain rather than trusting the image default.
+      # Xcode 27 refuses MACOSX_DEPLOYMENT_TARGET < 12.0 and its SDK's own
+      # minimum deployment is 12.0, so if GitHub ever moves this image's
+      # default to 27.x this job would go red for a toolchain reason and look
+      # exactly like a real floor regression. Selecting explicitly — and
+      # failing with a specific message when no 26.x exists — keeps the
+      # signal honest.
+      - name: Select an Xcode 26.x toolchain (predates the 12.0 clamp)
+        run: |
+          latest=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$latest" ]; then
+            echo "error: no Xcode 26.x on this runner. The floor check needs a toolchain" >&2
+            echo "predating the 12.0 deployment clamp; pin an older runner image or" >&2
+            echo "move release verification off GitHub-hosted runners." >&2
+            exit 1
+          fi
+          echo "Selecting $latest"
+          sudo xcode-select -s "$latest/Contents/Developer"
       - name: Show toolchain
         run: |
           sw_vers
           xcodebuild -version
           swift --version
+          sdk=$(xcrun --show-sdk-path)
+          echo "SDK: $sdk"
+          echo "SDK minimum deployment: $(plutil -extract SupportedTargets.macosx.MinimumDeploymentTarget raw "$sdk/SDKSettings.plist" 2>/dev/null || echo unknown)"
       - name: Verify macOS 11.0 floor on universal release binaries
         run: ./Scripts/ci-verify-floor.sh
       # The universal executable is assembled inside ci-verify-floor.sh, from
