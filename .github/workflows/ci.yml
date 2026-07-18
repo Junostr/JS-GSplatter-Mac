@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # Functional tests on the newest available runner — fast feedback.
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run self-tests
+        run: swift run selftest
+
+  # Guards the macOS 11.0 (Big Sur) deployment floor on a runner whose
+  # toolchain predates the 12.0 clamp (Xcode <= 26 / Swift <= 6.2). If GitHub
+  # retires this image, pin whatever oldest macOS image remains and select the
+  # oldest Xcode on it via xcode-select.
+  #
+  # SCOPE — read this before trusting a green check: this job proves the floor
+  # for the SwiftPM build path only. Releases ship via Scripts/build-app.sh,
+  # which uses a different path (raw swiftc, a pinned local MacOSX26.2 SDK, and
+  # DEVELOPER_DIR=Xcode-beta) that cannot run on a GitHub runner — neither that
+  # SDK nor Xcode-beta exists there. build-app.sh therefore carries its own
+  # equivalent minos assertion and fails loudly on drift; that is the guard for
+  # the shipping path. This job is the guard for the source/toolchain-agnostic
+  # floor. Neither one alone covers both.
+  deployment-floor:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          swift --version
+      - name: Verify macOS 11.0 floor on universal release binaries
+        run: ./Scripts/ci-verify-floor.sh
+      # The universal executable is assembled inside ci-verify-floor.sh, from
+      # slices it stashes immediately after each arch's build (SwiftPM's newer
+      # build system emits every triple to the same directory, so the slices
+      # cannot be lipo'd from their build locations afterwards).
+      #
+      # NOTE: a bare lipo'd executable, NOT a signed release bundle — no
+      # Info.plist, no code signature. Useful for inspecting the binary
+      # (lipo/otool) from a PR; not something to hand to a user. The real
+      # release artifact comes from Scripts/build-app.sh.
+      - name: Upload universal executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: GaussianSplatter-spm-universal-unsigned
+          path: dist/
