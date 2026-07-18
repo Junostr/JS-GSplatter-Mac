@@ -1005,6 +1005,137 @@ do {
            "fewer than 8 matches yields no result")
 }
 
+print("Focal estimation (synthetic, known ground truth):")
+do {
+    // The test that should have existed before any focal work. Real captures
+    // cannot validate this layer: the true focal is unknown, so an estimator
+    // that is consistently wrong looks exactly like one that is right.
+    //
+    // Several DIFFERENT true focals are checked deliberately. A single-focal
+    // test passes spuriously for an estimator that always returns the same
+    // answer — which is precisely the failure mode of the reverted attempt,
+    // where the score decreased monotonically and every capture came back at
+    // the bottom of the sweep range.
+    let width = 1920, height = 1080
+    let longSide = Double(max(width, height))
+    var recovered: [(truth: Double, estimate: Double)] = []
+
+    for (index, multiplier) in [0.65, 0.80, 1.00, 1.20].enumerated() {
+        let trueFocal = multiplier * longSide
+        let intrinsics = CameraIntrinsics(focalLength: trueFocal,
+                                          cx: Double(width) / 2, cy: Double(height) / 2)
+        let scene = makeSyntheticPair(pointCount: 160, rotationDegrees: 7,
+                                      baseline: SIMD3<Double>(0.55, 0.04, 0.02),
+                                      intrinsics: intrinsics, seed: UInt64(9000 + index))
+        guard let estimate = FocalEstimation.estimate(
+            pairs: [(scene.kp1, scene.kp2, scene.matches)],
+            imageWidth: width, imageHeight: height
+        ) else {
+            expect(false, "focal estimation returned a result for \(multiplier)x")
+            continue
+        }
+        recovered.append((trueFocal, estimate.focalLength))
+        let relativeError = abs(estimate.focalLength - trueFocal) / trueFocal
+        print(String(format: "      true %.2fx -> estimated %.2fx (%.0f%% error)",
+                     multiplier, estimate.focalLength / longSide, relativeError * 100))
+        // The sweep is discrete, so exact recovery is impossible; 15% is
+        // comfortably tighter than the spread that motivated this work
+        // (0.50x-0.90x on one camera) while allowing for grid quantisation.
+        expect(relativeError < 0.15,
+               "recovers \(multiplier)x focal within 15% (got \(estimate.focalLength / longSide)x)")
+    }
+
+    // The estimator must actually TRACK the truth, not return a constant that
+    // happens to sit near one of the test values.
+    if recovered.count >= 2 {
+        let spread = (recovered.map { $0.estimate }.max() ?? 0) - (recovered.map { $0.estimate }.min() ?? 0)
+        expect(spread > longSide * 0.2,
+               "estimates vary with the true focal rather than being constant (spread \(spread / longSide)x)")
+    }
+}
+
+print("Focal estimation under realistic degradation:")
+do {
+    // Clean synthetic data recovers the focal exactly, yet real captures swing
+    // 0.50x-0.90x. So the criterion is sound and something ABOUT REAL DATA
+    // breaks it. These cases add the differences one at a time to find which.
+    let width = 1920, height = 1080
+    let longSide = Double(max(width, height))
+    let trueMultiplier = 0.80
+    let trueFocal = trueMultiplier * longSide
+    let intrinsics = CameraIntrinsics(focalLength: trueFocal,
+                                      cx: Double(width) / 2, cy: Double(height) / 2)
+
+    func estimateMultiplier(_ kp1: [Keypoint], _ kp2: [Keypoint], _ matches: [FeatureMatch]) -> Double? {
+        FocalEstimation.estimate(pairs: [(kp1, kp2, matches)],
+                                 imageWidth: width, imageHeight: height)
+            .map { $0.focalLength / longSide }
+    }
+
+    // 1. Keypoint localisation noise. Real detectors are accurate to a fraction
+    //    of a pixel at best, and the pyramid makes coarse-level features worse.
+    for sigma in [0.5, 1.5, 3.0] {
+        var rng = SplitMix64(seed: UInt64(4000 + Int(sigma * 10)))
+        let scene = makeSyntheticPair(pointCount: 160, rotationDegrees: 7,
+                                      baseline: SIMD3<Double>(0.55, 0.04, 0.02),
+                                      intrinsics: intrinsics, seed: 321)
+        func jitter(_ kps: [Keypoint]) -> [Keypoint] {
+            kps.map { Keypoint(x: $0.x + Float(rng.nextGaussian()) * Float(sigma),
+                               y: $0.y + Float(rng.nextGaussian()) * Float(sigma),
+                               response: $0.response, angle: $0.angle,
+                               octave: $0.octave, scale: $0.scale) }
+        }
+        let m = estimateMultiplier(jitter(scene.kp1), jitter(scene.kp2), scene.matches)
+        print(String(format: "      noise %.1f px -> %@", sigma,
+                     m.map { String(format: "%.2fx", $0) } ?? "nil"))
+    }
+
+    // 2. Outlier matches, which survive the ratio test in repetitive scenes.
+    for fraction in [0.1, 0.25] {
+        var rng = SplitMix64(seed: UInt64(5000 + Int(fraction * 100)))
+        var scene = makeSyntheticPair(pointCount: 160, rotationDegrees: 7,
+                                      baseline: SIMD3<Double>(0.55, 0.04, 0.02),
+                                      intrinsics: intrinsics, seed: 321)
+        for _ in 0..<Int(Double(scene.matches.count) * fraction) {
+            let victim = Int(rng.next() % UInt64(scene.matches.count))
+            let wrong = Int(rng.next() % UInt64(scene.kp2.count))
+            scene.matches[victim] = FeatureMatch(queryIndex: scene.matches[victim].queryIndex,
+                                                 trainIndex: wrong, distance: 50)
+        }
+        let m = estimateMultiplier(scene.kp1, scene.kp2, scene.matches)
+        print(String(format: "      %.0f%% outliers -> %@", fraction * 100,
+                     m.map { String(format: "%.2fx", $0) } ?? "nil"))
+    }
+
+    // 3. Shallow depth spread. An orbit around one object at roughly constant
+    //    distance gives far less depth variation than the synthetic slab, and
+    //    depth variation is what makes the focal observable at all.
+    for depthSpread in [4.0, 1.0, 0.3] {
+        var rng = SplitMix64(seed: 888)
+        var kp1: [Keypoint] = [], kp2: [Keypoint] = []
+        var matches: [FeatureMatch] = []
+        let rotation = rotationAboutY(7)
+        let centre = SIMD3<Double>(0.55, 0.04, 0.02)
+        let rc = LinearAlgebra.matVec3(rotation, centre)
+        let pose2 = CameraPose(rotation: rotation, translation: SIMD3<Double>(-rc.x, -rc.y, -rc.z))
+        while kp1.count < 160 {
+            let p = SIMD3<Double>((Double(rng.nextUniform()) - 0.5) * 4,
+                                  (Double(rng.nextUniform()) - 0.5) * 3,
+                                  5.0 + Double(rng.nextUniform()) * depthSpread)
+            guard let a = CameraPose.identity.project(p, intrinsics: intrinsics),
+                  let b = pose2.project(p, intrinsics: intrinsics),
+                  a.x > 0, a.x < Double(width), a.y > 0, a.y < Double(height),
+                  b.x > 0, b.x < Double(width), b.y > 0, b.y < Double(height) else { continue }
+            matches.append(FeatureMatch(queryIndex: kp1.count, trainIndex: kp1.count, distance: 0))
+            kp1.append(Keypoint(x: Float(a.x), y: Float(a.y), response: 1, angle: 0))
+            kp2.append(Keypoint(x: Float(b.x), y: Float(b.y), response: 1, angle: 0))
+        }
+        let m = estimateMultiplier(kp1, kp2, matches)
+        print(String(format: "      depth spread %.1f -> %@", depthSpread,
+                     m.map { String(format: "%.2fx", $0) } ?? "nil"))
+    }
+}
+
 print("SIFT-like descriptor:")
 do {
     // A textured patch, and the SAME patch under a large global illumination

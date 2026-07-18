@@ -227,14 +227,36 @@ Implemented:
       decreases monotonically toward small focals instead of having an interior
       minimum at the truth. Consistently wrong is more dangerous than noisily
       right, so it was reverted rather than shipped.
-    - Next step for whoever picks this up: work out why the asymmetry has no
-      interior minimum before wiring it in again. Worth checking the principal
-      point's role in K (the sweep holds cx, cy at the image centre), whether
-      the asymmetry should be evaluated on a normalised F, and validating the
-      whole scorer against a SYNTHETIC pair with known focal — where the correct
-      answer is known — before trusting it on real footage. That synthetic test
-      is the piece this attempt skipped, and it would have caught the problem in
-      minutes rather than after a full real-capture sweep.
+    **The synthetic harness now exists** (`selftest`: "Focal estimation
+    (synthetic, known ground truth)" and "under realistic degradation"), and it
+    changed the diagnosis completely:
+
+    - On CLEAN synthetic pairs the current estimator recovers 0.65x, 0.80x,
+      1.00x and 1.20x **exactly, 0% error**, and the estimates track the truth
+      rather than being constant. So the criterion is not inherently broken.
+    - Degrading one property at a time isolates the cause. 10% and 25% outliers:
+      fine. Depth spread reduced from 4.0 to 0.3 (an orbit at near-constant
+      distance): fine. **Keypoint localisation noise is the whole story** —
+      0.5 px and 1.5 px recover 0.80x, 3.0 px collapses to 0.50x, the bottom of
+      the sweep and exactly the real-capture symptom.
+    - Mechanism: `TwoViewGeometry` converts its gate with
+      `threshold = pixels / focal`, so a smaller candidate focal literally
+      loosens the geometric test, admits more inliers and triangulates more
+      points. The score rewards small focals for being lenient, not for being
+      right — invisible on clean data, dominant once keypoints are noisy.
+    - Holding the gate constant in NORMALIZED units was tried and made things
+      worse: it simply inverts the bias, and noise then drives the estimate to
+      the sweep CEILING (1.5 px noise -> 1.90x, worse than the 0.80x it managed
+      before). Reverted.
+
+    Conclusion: **triangulated point count is the wrong score.** Any threshold
+    policy biases it in one direction or the other, because the score is a count
+    of whatever the gate admits. The fix needs a threshold-free criterion — a
+    robust median epipolar error in pixels over all matches, or the
+    fundamental-matrix asymmetry route (fit F once from pixels, minimise the
+    singular-value asymmetry of E = KᵀFK), which is now cheap to evaluate
+    properly because the synthetic harness can say immediately whether a
+    candidate criterion has an interior minimum at the true focal.
 
     **Resolved (was: 25/60 vs 29/60 from an identical binary).** Root cause was
     the registration queue: `remaining.sorted { support > support }` sorted a
