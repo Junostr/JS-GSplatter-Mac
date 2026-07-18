@@ -315,6 +315,7 @@ func runSfM(_ args: [String]) {
     var target = 40
     var forceCPU = false
     var plyPath: String?
+    var focalOverride: Double?
 
     var i = 0
     while i < args.count {
@@ -328,6 +329,9 @@ func runSfM(_ args: [String]) {
         case "--target":
             guard let n = Int(value(for: arg)), n > 0 else { fail("--target needs a positive integer", code: 2) }
             target = n
+        case "--focal":
+            guard let v = Double(value(for: arg)), v > 0 else { fail("--focal needs a positive number", code: 2) }
+            focalOverride = v
         case "--cpu": forceCPU = true
         case "--ply": plyPath = value(for: arg)
         default:
@@ -377,6 +381,7 @@ func runSfM(_ args: [String]) {
     // Stage 3: features on the surviving frames.
     var featureSets: [FeatureSet] = []
     var intrinsicsByFrame: [Int: CameraIntrinsics] = [:]
+    var frameWidth = 0, frameHeight = 0
     let start = Date()
     do {
         try FrameIngestor.ingest(source) { frame in
@@ -384,14 +389,33 @@ func runSfM(_ args: [String]) {
             let set = try extractor.extract(index: frame.index, pixelBuffer: frame.pixelBuffer,
                                             options: FeatureOptions(maxFeatures: 1500))
             featureSets.append(set)
-            intrinsicsByFrame[frame.index] = CameraIntrinsics.guess(width: frame.width, height: frame.height)
+            frameWidth = frame.width; frameHeight = frame.height
+            var intr = CameraIntrinsics.guess(width: frame.width, height: frame.height)
+            if let focalOverride = focalOverride { intr.focalLength = focalOverride }
+            intrinsicsByFrame[frame.index] = intr
             return true
         }
     } catch { fail("Feature extraction failed: \(error)") }
     let featureElapsed = Date().timeIntervalSince(start)
     let totalFeatures = featureSets.reduce(0) { $0 + $1.count }
     print("Features:     \(totalFeatures) over \(featureSets.count) frames in \(String(format: "%.2f", featureElapsed))s")
-    print("Intrinsics:   focal ≈ \(Int(intrinsicsByFrame.values.first?.focalLength ?? 0)) px (guessed — no EXIF calibration)")
+
+    // Estimate focal from the geometry unless overridden. The fixed heuristic
+    // is badly wrong for phone cameras and a wrong focal fails confidently
+    // rather than obviously -- see FocalEstimation.swift.
+    if focalOverride == nil, let first = featureSets.first, first.count > 0 {
+        let w = frameWidth, h = frameHeight
+        if let estimate = FocalEstimation.estimate(featureSets: featureSets, imageWidth: w, imageHeight: h) {
+            let multiplier = estimate.focalLength / Double(max(w, h))
+            print("Intrinsics:   focal ≈ \(Int(estimate.focalLength)) px (estimated, \(String(format: "%.2f", multiplier))× long side, "
+                  + "\(estimate.supportingPoints) supporting points, median \(String(format: "%.2f", estimate.medianReprojectionError)) px)")
+            for key in intrinsicsByFrame.keys { intrinsicsByFrame[key]?.focalLength = estimate.focalLength }
+        } else {
+            print("Intrinsics:   focal ≈ \(Int(intrinsicsByFrame.values.first?.focalLength ?? 0)) px (guess — estimation failed)")
+        }
+    } else {
+        print("Intrinsics:   focal ≈ \(Int(intrinsicsByFrame.values.first?.focalLength ?? 0)) px \(focalOverride != nil ? "(--focal override)" : "(guessed)")")
+    }
 
     guard featureSets.count >= 2 else { fail("Need at least 2 usable frames, got \(featureSets.count)") }
 

@@ -91,13 +91,31 @@ Implemented:
   robust to 25% outliers, 6/6 cameras registered end to end at 1.3e-5 px RMSE,
   and bit-identical across runs.
 
-  **Known limitation:** two-view initialization degenerates on plane-dominant
-  scenes, where the 8-point algorithm cannot determine E uniquely — RANSAC
-  reports a large inlier set but the pose is wrong and points fail cheirality
-  (measured: 99 inliers, 4 triangulated). The fix is homography/essential
-  model selection as in ORB-SLAM. Captures orbiting a real object with depth
-  variation are unaffected, but this needs doing before real-world captures
-  are reliable.
+  **Focal length is estimated from the geometry**, not guessed
+  (`FocalEstimation`). The old `1.2 x long side` heuristic implies ~45 deg FOV
+  and is badly wrong for phone cameras (~69 deg at 4K). A wrong focal is not a
+  scale error: the essential matrix is only an essential matrix under correct
+  calibration, so it fails *confidently* — RANSAC fits an unrealizable model,
+  cheirality rejects nearly everything, and BA deletes the rest. Measured on a
+  real 3840x2160 iPhone capture:
+
+  | focal | inliers | RMSE after BA | points |
+  |---|---|---|---|
+  | 4608 (old 1.2x guess) | 120 | 14.29 px | 0 |
+  | 3200 | 301 | 1.02 px | 125 |
+  | 2880 (auto-estimated, 0.75x) | 169 | **0.42 px** | 169 |
+
+  **Known limitations (real captures are NOT yet reliable):**
+  - *Incremental registration stalls.* On the real capture above, two-view
+    initialization succeeds at 0.42 px but only 2 of 20 cameras register.
+    Candidate frames have 20-28 correspondences available, so PnP is running
+    and failing: the best available seed pair is short-baseline, its points are
+    too shallow to register against, and there is no re-triangulation loop to
+    deepen the structure as cameras are added. That loop is the next task.
+  - *Plane-dominant scenes.* The 8-point algorithm cannot determine E uniquely
+    when the points lie near a plane; RANSAC reports a large inlier set but the
+    pose is wrong (measured: 99 inliers, 4 triangulated). Fix is
+    homography/essential model selection as in ORB-SLAM.
 
 Not yet implemented: real training kernels (stage 5), viewer (stage 6),
 export (stage 7), and homography-based initialization for planar scenes.

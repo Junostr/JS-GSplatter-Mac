@@ -128,12 +128,40 @@ public enum StructureFromMotion {
         // triangulation angle, so its size is a direct measure of how much
         // usable structure a pair actually provides.
         var bestPair: (pair: Pair, result: TwoViewResult)?
+        var bestScore = -Double.infinity
         var evaluated = 0
         let candidateLimit = 25
-        for (pair, matches) in pairMatches.sorted(by: {
-            $0.value.count != $1.value.count ? $0.value.count > $1.value.count
-                                             : ($0.key.a, $0.key.b) < ($1.key.a, $1.key.b)
-        }) {
+        // Build a candidate pool that SPANS baselines, rather than sorting
+        // by any single key.
+        //
+        // Both naive orderings fail, and they fail in opposite directions:
+        //   - by match count: near-adjacent pairs always match most densely,
+        //     so the whole bounded pool is short-baseline and the seed stays
+        //     pinned to frames 4 apart -- 169 points at 0.42 px RMSE, then
+        //     ZERO further cameras registered because the structure is too
+        //     shallow to register against.
+        //   - by separation: the widest pairs barely overlap, every candidate
+        //     fails, the budget is exhausted before reaching usable pairs, and
+        //     initialization reports "no pair had enough parallax" outright.
+        // Taking the best few pairs at EACH separation walks the whole range
+        // within the same evaluation budget, and the points x parallax score
+        // then picks among genuinely different options.
+        let orderedFrameIndex = Dictionary(uniqueKeysWithValues: frames.enumerated().map { ($1, $0) })
+        var bySeparation: [Int: [(key: Pair, value: [FeatureMatch])]] = [:]
+        for (pair, matches) in pairMatches {
+            let separation = abs((orderedFrameIndex[pair.b] ?? 0) - (orderedFrameIndex[pair.a] ?? 0))
+            bySeparation[separation, default: []].append((pair, matches))
+        }
+        var candidates: [(key: Pair, value: [FeatureMatch])] = []
+        let perSeparation = 3
+        for separation in bySeparation.keys.sorted(by: >) {
+            let group = bySeparation[separation]!.sorted {
+                $0.value.count != $1.value.count ? $0.value.count > $1.value.count
+                                                 : ($0.key.a, $0.key.b) < ($1.key.a, $1.key.b)
+            }
+            candidates.append(contentsOf: group.prefix(perSeparation))
+        }
+        for (pair, matches) in candidates {
             guard matches.count >= options.minPairInliers else { continue }
             guard evaluated < candidateLimit else { break }
             evaluated += 1
@@ -150,7 +178,21 @@ public enum StructureFromMotion {
             let medianAngle = angles[angles.count / 2]
             guard medianAngle >= options.minInitialAngleDegrees else { continue }
 
-            if bestPair == nil || result.points.count > bestPair!.result.points.count {
+            // Score on points x parallax, not points alone.
+            //
+            // Point count by itself systematically favours SMALL baselines:
+            // near-adjacent frames match more densely, so more points clear
+            // cheirality. But the resulting points have enormous depth
+            // uncertainty, and every subsequent camera has to register against
+            // them -- so PnP is ill-conditioned and finds too few inliers.
+            // Measured on a real 4K capture: a 4-frame-apart seed produced 169
+            // points at 0.42 px RMSE and then registered ZERO further cameras,
+            // despite candidates having 20-28 correspondences available.
+            // Weighting by median triangulation angle prefers a seed whose
+            // structure is actually well-conditioned for what comes next.
+            let score = Double(result.points.count) * medianAngle
+            if bestPair == nil || score > bestScore {
+                bestScore = score
                 bestPair = (pair, result)
             }
         }
