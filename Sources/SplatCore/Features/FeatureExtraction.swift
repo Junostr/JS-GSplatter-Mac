@@ -83,10 +83,29 @@ public struct FeatureOptions {
     /// instead of clumping on one high-contrast edge.
     public var nmsRadius: Int
 
-    public init(maxFeatures: Int = 2000, relativeThreshold: Float = 0.01, nmsRadius: Int = 4) {
+    /// Grid resolution for spatial bucketing (N means an NxN grid). 0 disables
+    /// it and reverts to pure global ranking.
+    ///
+    /// Without this, `maxFeatures` is filled by global Harris response, and one
+    /// high-contrast region takes the entire budget. Observed on a real
+    /// capture of a plant on an ornately engraved brass tray: essentially all
+    /// 1200 keypoints landed on the tray and the plant, while richly textured
+    /// floor, furniture and fabric elsewhere in frame got almost none. Features
+    /// packed into one small, near-planar region give a poorly conditioned
+    /// reconstruction — it is close to the planar-degeneracy case even though
+    /// the room itself is fully three-dimensional.
+    ///
+    /// Bucketing takes the strongest few per cell first, so coverage is spread
+    /// across the frame before raw strength is allowed to dominate. Every
+    /// mature SfM implementation does some version of this.
+    public var spatialBuckets: Int
+
+    public init(maxFeatures: Int = 2000, relativeThreshold: Float = 0.01, nmsRadius: Int = 4,
+                spatialBuckets: Int = 8) {
         self.maxFeatures = maxFeatures
         self.relativeThreshold = relativeThreshold
         self.nmsRadius = nmsRadius
+        self.spatialBuckets = spatialBuckets
     }
 }
 
@@ -264,13 +283,51 @@ public enum FeatureMath {
         // a genuine total order — an epsilon-tolerant comparator would not be
         // transitive and would make sort() undefined behavior.
         let sortScale = Float(1 << 20) / maxResponse
-        candidates.sort { a, b in
+        func rank(_ a: (index: Int, x: Int, y: Int, value: Float),
+                  _ b: (index: Int, x: Int, y: Int, value: Float)) -> Bool {
             let ka = (a.value * sortScale).rounded()
             let kb = (b.value * sortScale).rounded()
             return ka != kb ? ka > kb : a.index < b.index
         }
+        candidates.sort(by: rank)
+
         if candidates.count > options.maxFeatures {
-            candidates.removeSubrange(options.maxFeatures...)
+            let grid = options.spatialBuckets
+            if grid > 1 {
+                // Round-robin over grid cells: take the strongest remaining
+                // feature from each occupied cell in turn, so coverage spreads
+                // before strength dominates. Cells are visited in a fixed
+                // order and each cell's list is already rank-sorted, so the
+                // result stays deterministic and cross-tier-stable.
+                var cells: [Int: [Int]] = [:]   // cell -> candidate indices, strongest first
+                for (i, candidate) in candidates.enumerated() {
+                    let cx = min(grid - 1, candidate.x * grid / width)
+                    let cy = min(grid - 1, candidate.y * grid / height)
+                    cells[cy * grid + cx, default: []].append(i)
+                }
+                var cursor = [Int: Int]()
+                var chosen: [Int] = []
+                chosen.reserveCapacity(options.maxFeatures)
+                let cellOrder = cells.keys.sorted()
+                var exhausted = false
+                while chosen.count < options.maxFeatures && !exhausted {
+                    exhausted = true
+                    for cell in cellOrder {
+                        guard chosen.count < options.maxFeatures else { break }
+                        let list = cells[cell]!
+                        let position = cursor[cell] ?? 0
+                        guard position < list.count else { continue }
+                        chosen.append(list[position])
+                        cursor[cell] = position + 1
+                        exhausted = false
+                    }
+                }
+                // Restore strongest-first ordering across the selected set.
+                candidates = chosen.sorted().map { candidates[$0] }
+                candidates.sort(by: rank)
+            } else {
+                candidates.removeSubrange(options.maxFeatures...)
+            }
         }
 
         return candidates.map { candidate in

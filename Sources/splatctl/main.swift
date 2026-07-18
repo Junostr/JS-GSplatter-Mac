@@ -37,8 +37,10 @@ case "filter":
     runFilter(args)
 case "sfm":
     runSfM(args)
+case "features":
+    runFeatures(args)
 default:
-    fail("Unknown command '\(command)'. Commands: probe, ingest, filter, sfm", code: 2)
+    fail("Unknown command '\(command)'. Commands: probe, ingest, filter, sfm, features", code: 2)
 }
 
 // MARK: - probe
@@ -306,6 +308,86 @@ func runFilter(_ args: [String]) {
             fail("Saving selected frames failed: \(error)")
         }
     }
+}
+
+// MARK: - features (visual diagnostic)
+
+/// Render detected keypoints onto frames. Where features actually land decides
+/// whether a failed reconstruction is a pipeline bug or an unreconstructable
+/// scene — specular highlights and glass reflections produce strong, stable-
+/// looking corners that are not attached to any real 3D point.
+func runFeatures(_ args: [String]) {
+    var inputPath: String?
+    var saveDir: String?
+    var every = 40
+
+    var i = 0
+    while i < args.count {
+        let arg = args[i]
+        func value(for flag: String) -> String {
+            i += 1
+            guard i < args.count else { fail("Missing value for \(flag)", code: 2) }
+            return args[i]
+        }
+        switch arg {
+        case "--save": saveDir = value(for: arg)
+        case "--every":
+            guard let n = Int(value(for: arg)), n > 0 else { fail("--every needs a positive integer", code: 2) }
+            every = n
+        default:
+            if arg.hasPrefix("--") { fail("Unknown flag \(arg)", code: 2) }
+            inputPath = arg
+        }
+        i += 1
+    }
+    guard let inputPath = inputPath, let saveDir = saveDir else {
+        fail("Usage: splatctl features <photo-folder|video> --save <dir> [--every N]", code: 2)
+    }
+    let outURL = URL(fileURLWithPath: saveDir, isDirectory: true)
+    try? FileManager.default.createDirectory(at: outURL, withIntermediateDirectories: true)
+
+    let source: IngestionSource
+    do { source = try IngestionSource.detect(at: URL(fileURLWithPath: inputPath)) }
+    catch { fail("\(error)") }
+
+    let extractor = FeatureExtractorFactory.make()
+    print("Extractor:    \(extractor.descriptionForLog)")
+    var written = 0
+    do {
+        try FrameIngestor.ingest(source) { frame in
+            guard frame.index % every == 0, written < 6 else { return true }
+            let set = try extractor.extract(index: frame.index, pixelBuffer: frame.pixelBuffer,
+                                            options: FeatureOptions(maxFeatures: 1200))
+            let image = try frame.makeCGImage()
+            let w = image.width, h = image.height
+            guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                                | CGBitmapInfo.byteOrder32Little.rawValue) else { return true }
+            ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
+            // Keypoints are top-left origin; CGContext is bottom-left.
+            let maxResponse = set.keypoints.first?.response ?? 1
+            ctx.setLineWidth(max(2, Double(w) / 700))
+            for kp in set.keypoints {
+                let strength = maxResponse > 0 ? Double(kp.response / maxResponse) : 0
+                // Strong corners red, weak ones blue.
+                ctx.setStrokeColor(CGColor(red: 0.2 + 0.8 * strength, green: 0.9 - 0.7 * strength,
+                                           blue: 1.0 - 0.9 * strength, alpha: 0.95))
+                let r = max(4.0, Double(w) / 260)
+                ctx.strokeEllipse(in: CGRect(x: Double(kp.x) - r, y: Double(h) - Double(kp.y) - r,
+                                             width: r * 2, height: r * 2))
+            }
+            guard let out = ctx.makeImage() else { return true }
+            let url = outURL.appendingPathComponent(String(format: "features_%05d.jpg", frame.index))
+            if let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.jpeg.identifier as CFString, 1, nil) {
+                CGImageDestinationAddImage(dest, out, [kCGImageDestinationLossyCompressionQuality: 0.8] as CFDictionary)
+                _ = CGImageDestinationFinalize(dest)
+            }
+            print("  frame \(frame.index): \(set.count) keypoints → \(url.lastPathComponent)")
+            written += 1
+            return true
+        }
+    } catch { fail("Feature visualization failed: \(error)") }
 }
 
 // MARK: - sfm

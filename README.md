@@ -105,6 +105,10 @@ Implemented:
   | 3200 | 301 | 1.02 px | 125 |
   | 2880 (auto-estimated, 0.75x) | 169 | **0.42 px** | 169 |
 
+  **Feature selection is spatially bucketed** (`FeatureOptions.spatialBuckets`)
+  so one high-contrast region cannot take the whole `maxFeatures` budget.
+  Note this addresses only the *cap*; see the threshold limitation below.
+
   **Known limitations (real captures are NOT yet reliable):**
   - *Incremental registration stalls.* On the real capture above, two-view
     initialization succeeds at 0.42 px but only 2 of 20 cameras register.
@@ -116,6 +120,23 @@ Implemented:
     when the points lie near a plane; RANSAC reports a large inlier set but the
     pose is wrong (measured: 99 inliers, 4 triangulated). Fix is
     homography/essential model selection as in ORB-SLAM.
+  - *Features concentrate in one region, and bucketing does not fix it.*
+    Visualized on the real capture (`splatctl features <input> --save <dir>`):
+    nearly every keypoint lands on one ornate brass tray and the plant on it,
+    while well-textured floor and furniture get almost none. The cause is
+    `relativeThreshold` — the cutoff is 1% of the frame's MAXIMUM Harris
+    response, so a single very high-contrast object raises the floor above
+    everything else. Spatial bucketing only rebalances features once the
+    `maxFeatures` cap binds, and on these frames it never does (553 candidates
+    vs a 1200 cap), so it changes nothing. The real fix is a per-cell adaptive
+    threshold rather than one global relative cutoff.
+  - *Focal estimation is not yet robust.* It recovered a plausible 0.75x long
+    side (2880 px) on one feature set but 0.50x (1920 px) on a nearly identical
+    one — and 0.50 is the edge of the sweep range, which means the score stopped
+    discriminating rather than found a minimum. Consistent with the tray-
+    dominated, near-planar feature distribution above: a degenerate
+    configuration fits many focal lengths about equally well. Needs a
+    stability check across pairs, and probably the planar fix first.
 
 Not yet implemented: real training kernels (stage 5), viewer (stage 6),
 export (stage 7), and homography-based initialization for planar scenes.
