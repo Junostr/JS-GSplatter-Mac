@@ -23,15 +23,19 @@ public struct SfMOptions {
     /// against them.
     public var minInitialAngleDegrees: Double
     public var bundleAdjust: Bool
+    /// Run an interim bundle adjustment after this many newly registered
+    /// cameras. Keeps structure tight so later PnP stays well conditioned.
+    public var bundleEveryNCameras: Int
 
     public init(matchWindow: Int = 6, maxFeaturesPerFrame: Int = 1500,
                 minPairInliers: Int = 30, minInitialAngleDegrees: Double = 1.2,
-                bundleAdjust: Bool = true) {
+                bundleAdjust: Bool = true, bundleEveryNCameras: Int = 3) {
         self.matchWindow = matchWindow
         self.maxFeaturesPerFrame = maxFeaturesPerFrame
         self.minPairInliers = minPairInliers
         self.minInitialAngleDegrees = minInitialAngleDegrees
         self.bundleAdjust = bundleAdjust
+        self.bundleEveryNCameras = bundleEveryNCameras
     }
 }
 
@@ -241,6 +245,79 @@ public enum StructureFromMotion {
         // Register remaining frames, most-supported first. Support and
         // correspondence both come from PAIRWISE matches against already
         // registered frames, not from global tracks.
+        // Does `position` land close enough to `keypoint` in `camera`?
+        func reprojectsWell(_ position: SIMD3<Double>, _ camera: RegisteredCamera,
+                            _ keypoint: Keypoint, tolerance: Double = 6.0) -> Bool {
+            guard let projected = camera.pose.project(position, intrinsics: camera.intrinsics) else { return false }
+            let dx = projected.x - Double(keypoint.x), dy = projected.y - Double(keypoint.y)
+            return (dx * dx + dy * dy).squareRoot() < tolerance
+        }
+
+        /// Extend existing points with new observations and triangulate new
+        /// ones, over every match between two registered cameras.
+        func growStructure() -> (extended: Int, created: Int) {
+            var extended = 0, created = 0
+            let registered = reconstruction.cameras.keys.sorted()
+            for (i, a) in registered.enumerated() {
+                for b in registered[(i + 1)...] {
+                    guard let matches = pairMatches[Pair(a, b)],
+                          let camA = reconstruction.cameras[a], let camB = reconstruction.cameras[b],
+                          let kpA = keypointsByFrame[a], let kpB = keypointsByFrame[b] else { continue }
+                    // Pair(a,b) keeps a < b, and matches were built with the
+                    // lower frame as query, so query indexes a and train b.
+                    for match in matches {
+                        let ka = match.queryIndex, kb = match.trainIndex
+                        guard ka < kpA.count, kb < kpB.count else { continue }
+                        let obsA = Observation(frame: a, keypoint: ka)
+                        let obsB = Observation(frame: b, keypoint: kb)
+                        let pointA = pointForObservation[obsA]
+                        let pointB = pointForObservation[obsB]
+
+                        if let p = pointA, pointB == nil {
+                            guard reprojectsWell(reconstruction.points[p].position, camB, kpB[kb]) else { continue }
+                            if !reconstruction.points[p].observations.contains(where: { $0.frame == b }) {
+                                reconstruction.points[p].observations.append((frame: b, keypoint: kb))
+                            }
+                            pointForObservation[obsB] = p
+                            extended += 1
+                        } else if let p = pointB, pointA == nil {
+                            guard reprojectsWell(reconstruction.points[p].position, camA, kpA[ka]) else { continue }
+                            if !reconstruction.points[p].observations.contains(where: { $0.frame == a }) {
+                                reconstruction.points[p].observations.append((frame: a, keypoint: ka))
+                            }
+                            pointForObservation[obsA] = p
+                            extended += 1
+                        } else if pointA == nil && pointB == nil {
+                            let nA = camA.intrinsics.normalize(x: Double(kpA[ka].x), y: Double(kpA[ka].y))
+                            let nB = camB.intrinsics.normalize(x: Double(kpB[kb].x), y: Double(kpB[kb].y))
+                            guard let position = TwoViewGeometry.triangulate(
+                                p1: nA, p2: nB, pose1: camA.pose, pose2: camB.pose) else { continue }
+                            guard camA.pose.transform(position).z > 0,
+                                  camB.pose.transform(position).z > 0 else { continue }
+                            guard TwoViewGeometry.triangulationAngleDegrees(
+                                point: position, pose1: camA.pose, pose2: camB.pose) >= 1.0 else { continue }
+                            guard reprojectsWell(position, camA, kpA[ka], tolerance: 4.0),
+                                  reprojectsWell(position, camB, kpB[kb], tolerance: 4.0) else { continue }
+                            let pointIndex = reconstruction.points.count
+                            reconstruction.points.append(ScenePoint(
+                                position: position,
+                                observations: [(frame: a, keypoint: ka), (frame: b, keypoint: kb)]
+                            ))
+                            pointForObservation[obsA] = pointIndex
+                            pointForObservation[obsB] = pointIndex
+                            created += 1
+                        }
+                    }
+                }
+            }
+            return (extended, created)
+        }
+
+        var registeredSinceBA = 0
+        // Seed the structure once before any registration, so the very first
+        // candidate sees everything the initial pair can support.
+        _ = growStructure()
+
         var remaining = Set(frames).subtracting([seed.pair.a, seed.pair.b])
         var progress = true
         while progress && !remaining.isEmpty {
@@ -282,74 +359,40 @@ public enum StructureFromMotion {
                 remaining.remove(frame)
                 progress = true
 
-                // Link this frame's inlier observations to their points.
-                for i in pnp.inliers {
-                    let keypointIndex = c.keypoints[i]
-                    let observation = Observation(frame: frame, keypoint: keypointIndex)
-                    guard pointForObservation[observation] == nil else { continue }
-                    // Find which point this correspondence referred to.
-                    for registered in reconstruction.cameras.keys where registered != frame {
-                        guard let matches = pairMatches[Pair(frame, registered)] else { continue }
-                        let frameIsQuery = frame < registered
-                        for match in matches {
-                            let frameKp = frameIsQuery ? match.queryIndex : match.trainIndex
-                            guard frameKp == keypointIndex else { continue }
-                            let otherKp = frameIsQuery ? match.trainIndex : match.queryIndex
-                            guard let pointIndex = pointForObservation[Observation(frame: registered, keypoint: otherKp)]
-                            else { continue }
-                            if !reconstruction.points[pointIndex].observations.contains(where: { $0.frame == frame }) {
-                                reconstruction.points[pointIndex].observations.append((frame: frame, keypoint: keypointIndex))
-                            }
-                            pointForObservation[observation] = pointIndex
-                            break
-                        }
-                        if pointForObservation[observation] != nil { break }
-                    }
+                // Grow structure across ALL registered pairs, not just the
+                // pairs involving the frame that was just added.
+                //
+                // The previous version did two narrower things and coverage
+                // could not propagate around an orbit: it linked observations
+                // only for PnP INLIERS (11 of 18 on a real frame), and when
+                // triangulating it skipped any match where EITHER endpoint
+                // already had a point. Since seed-frame keypoints all have
+                // points, that skipped exactly the matches that would have
+                // carried structure forward — so the next frame round the arc
+                // was left with ~7 correspondences and could not register.
+                //
+                // Two passes, run to a fixed point:
+                //   - extend: a match where one side has a point and the other
+                //     does not attaches the new observation (subject to
+                //     reprojection), which is what propagates tracks.
+                //   - create: a match where neither side has a point
+                //     triangulates a new one.
+                let (extended, added) = growStructure()
+
+                log?("registered frame \(frame) (\(pnp.inliers.count)/\(c.world.count) PnP inliers, "
+                     + "+\(added) points, +\(extended) observations)")
+
+                // Periodic bundle adjustment. Structure triangulated from a
+                // two-view seed still carries depth error, and every camera
+                // registered afterwards inherits it; tightening as we go keeps
+                // later PnP well conditioned instead of letting drift compound.
+                registeredSinceBA += 1
+                if options.bundleAdjust && registeredSinceBA >= options.bundleEveryNCameras {
+                    registeredSinceBA = 0
+                    let interim = BundleAdjustment.refine(reconstruction: &reconstruction,
+                                                          keypoints: keypointsByFrame)
+                    log?(String(format: "  interim BA: %.3f -> %.3f px", interim.initialRMSE, interim.finalRMSE))
                 }
-
-                // Triangulate NEW points from matches to registered frames
-                // where neither endpoint is triangulated yet.
-                var added = 0
-                for registered in reconstruction.cameras.keys where registered != frame {
-                    guard let matches = pairMatches[Pair(frame, registered)],
-                          let camA = reconstruction.cameras[registered],
-                          let keypointsA = keypointsByFrame[registered] else { continue }
-                    let camB = reconstruction.cameras[frame]!
-                    let frameIsQuery = frame < registered
-                    for match in matches {
-                        let frameKp = frameIsQuery ? match.queryIndex : match.trainIndex
-                        let otherKp = frameIsQuery ? match.trainIndex : match.queryIndex
-                        guard frameKp < keypoints.count, otherKp < keypointsA.count else { continue }
-                        let obsNew = Observation(frame: frame, keypoint: frameKp)
-                        let obsOld = Observation(frame: registered, keypoint: otherKp)
-                        guard pointForObservation[obsNew] == nil, pointForObservation[obsOld] == nil else { continue }
-
-                        let nA = camA.intrinsics.normalize(x: Double(keypointsA[otherKp].x), y: Double(keypointsA[otherKp].y))
-                        let nB = camB.intrinsics.normalize(x: Double(keypoints[frameKp].x), y: Double(keypoints[frameKp].y))
-                        guard let position = TwoViewGeometry.triangulate(
-                            p1: nA, p2: nB, pose1: camA.pose, pose2: camB.pose) else { continue }
-                        guard camA.pose.transform(position).z > 0, camB.pose.transform(position).z > 0 else { continue }
-                        guard TwoViewGeometry.triangulationAngleDegrees(
-                            point: position, pose1: camA.pose, pose2: camB.pose) >= 1.0 else { continue }
-                        // Reject points that do not actually reproject well.
-                        guard let pa = camA.pose.project(position, intrinsics: camA.intrinsics),
-                              let pb = camB.pose.project(position, intrinsics: camB.intrinsics) else { continue }
-                        let ea = (pa - SIMD2<Double>(Double(keypointsA[otherKp].x), Double(keypointsA[otherKp].y)))
-                        let eb = (pb - SIMD2<Double>(Double(keypoints[frameKp].x), Double(keypoints[frameKp].y)))
-                        guard (ea.x*ea.x + ea.y*ea.y).squareRoot() < 4.0,
-                              (eb.x*eb.x + eb.y*eb.y).squareRoot() < 4.0 else { continue }
-
-                        let pointIndex = reconstruction.points.count
-                        reconstruction.points.append(ScenePoint(
-                            position: position,
-                            observations: [(frame: registered, keypoint: otherKp), (frame: frame, keypoint: frameKp)]
-                        ))
-                        pointForObservation[obsNew] = pointIndex
-                        pointForObservation[obsOld] = pointIndex
-                        added += 1
-                    }
-                }
-                log?("registered frame \(frame) (\(pnp.inliers.count)/\(c.world.count) PnP inliers, +\(added) points)")
                 break
             }
         }

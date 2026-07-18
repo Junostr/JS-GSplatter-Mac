@@ -110,14 +110,25 @@ Implemented:
   Note this addresses only the *cap*; see the threshold limitation below.
 
   **Known limitations (real captures are NOT yet reliable):**
-  - *Incremental registration stalls after the first camera.* Registration now
-    works (2 -> 3 cameras on the real capture, RMSE 0.878 px) but stops there:
-    a new frame only gets points triangulated where it matched an
-    ALREADY-registered frame, so coverage does not propagate around an orbit —
-    the next frame is left with ~7 correspondences, below what PnP needs. The
-    fix is a re-triangulation loop that re-triangulates all match pairs among
-    registered cameras after each registration, with periodic bundle
-    adjustment. This is the main outstanding item.
+  - *Incremental registration still stalls part-way round an orbit.* A
+    structure-growth pass now runs after every registration over ALL pairs of
+    registered cameras — extending existing points with new observations as
+    well as triangulating new ones — plus an interim bundle adjustment every 3
+    cameras. That took the real capture from 2 to 5 registered cameras, with
+    PnP inlier counts going from 10/19 to 104/214, but it does not yet complete
+    a full orbit.
+
+    The remaining bottleneck looks like DESCRIPTOR MATCHING across viewpoint
+    change, not the SfM logic: sampling 60 frames instead of 20 (smaller gaps
+    between neighbours) more than doubled the registered cameras on its own.
+    BRIEF is not scale- or strongly rotation-invariant, so matching degrades
+    over the ~0.7 s of handheld orbital motion between sparsely sampled frames.
+    Likely next steps, in order: a scale pyramid for the detector/descriptor,
+    guided matching along epipolar lines once a pose is known, and loop closure
+    so the end of an orbit re-links to its start.
+
+    Practical note meanwhile: prefer `--target 60` or higher on real captures.
+    Denser sampling costs little and matters more than any tuning knob here.
   - *Plane-dominant scenes.* The 8-point algorithm cannot determine E uniquely
     when the points lie near a plane; RANSAC reports a large inlier set but the
     pose is wrong (measured: 99 inliers, 4 triangulated). Fix is
