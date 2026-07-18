@@ -158,6 +158,70 @@ public enum TwoViewGeometry {
         )
     }
 
+    /// Fundamental matrix from PIXEL correspondences, via RANSAC.
+    ///
+    /// F depends only on the images, not on any calibration guess — which is
+    /// what makes it the right basis for judging candidate focal lengths. Rank
+    /// 2 is enforced, as a valid F must be singular.
+    public static func fundamentalRANSAC(
+        p1: [SIMD2<Double>], p2: [SIMD2<Double>],
+        thresholdPixels: Double = 2.0, maxIterations: Int = 800,
+        seed: UInt64 = 0x2545_F491_4F6C_DD1D
+    ) -> (matrix: [Double], inliers: [Int])? {
+        guard p1.count >= 8, p1.count == p2.count else { return nil }
+        var rng = SplitMix64(seed: seed)
+        var bestInliers: [Int] = []
+
+        func fit(_ a: [SIMD2<Double>], _ b: [SIMD2<Double>]) -> [Double]? {
+            guard let (n1, t1) = hartleyNormalize(a), let (n2, t2) = hartleyNormalize(b) else { return nil }
+            var rows: [[Double]] = []
+            for i in 0..<n1.count {
+                let u = n1[i], v = n2[i]
+                rows.append([v.x * u.x, v.x * u.y, v.x,
+                             v.y * u.x, v.y * u.y, v.y,
+                             u.x,       u.y,       1])
+            }
+            let solution = LinearAlgebra.smallestSingularVector(rows: rows)
+            guard solution.count == 9 else { return nil }
+            let (u, sv, vt) = LinearAlgebra.svd3x3(solution)
+            let d: [Double] = [sv[0], 0, 0, 0, sv[1], 0, 0, 0, 0]
+            let rank2 = LinearAlgebra.matMul3(u, LinearAlgebra.matMul3(d, vt))
+            return LinearAlgebra.matMul3(LinearAlgebra.transpose3(t2),
+                                         LinearAlgebra.matMul3(rank2, t1))
+        }
+
+        for _ in 0..<maxIterations {
+            var indices = Set<Int>()
+            var attempts = 0
+            while indices.count < 8 && attempts < 100 {
+                indices.insert(Int(rng.next() % UInt64(p1.count)))
+                attempts += 1
+            }
+            guard indices.count == 8 else { continue }
+            let sample = Array(indices)
+            guard let f = fit(sample.map { p1[$0] }, sample.map { p2[$0] }) else { continue }
+            var inliers: [Int] = []
+            for i in 0..<p1.count where sampsonDistance(e: f, x1: p1[i], x2: p2[i]) < thresholdPixels {
+                inliers.append(i)
+            }
+            if inliers.count > bestInliers.count { bestInliers = inliers }
+        }
+        guard bestInliers.count >= 8,
+              let refined = fit(bestInliers.map { p1[$0] }, bestInliers.map { p2[$0] }) else { return nil }
+        return (refined, bestInliers)
+    }
+
+    /// Singular-value asymmetry of E = KᵀFK — how far this calibration is from
+    /// making F a valid essential matrix. A true E has singular values (s, s, 0).
+    public static func calibrationAsymmetry(fundamental: [Double], intrinsics: CameraIntrinsics) -> Double? {
+        let f = intrinsics.focalLength
+        let k: [Double] = [f, 0, intrinsics.cx, 0, f, intrinsics.cy, 0, 0, 1]
+        let e = LinearAlgebra.matMul3(LinearAlgebra.transpose3(k), LinearAlgebra.matMul3(fundamental, k))
+        let (_, sv, _) = LinearAlgebra.svd3x3(e)
+        guard sv[0] > 1e-15 else { return nil }
+        return (sv[0] - sv[1]) / (sv[0] + sv[1])
+    }
+
     /// Normalized 8-point algorithm on already-calibrated points.
     ///
     /// Hartley normalization (centroid to origin, mean distance sqrt(2)) is
@@ -224,7 +288,7 @@ public enum TwoViewGeometry {
     /// First-order geometric error of the epipolar constraint.
     /// Preferred over the raw algebraic residual x2ᵀEx1, which is biased by
     /// how far a point sits from the epipole.
-    static func sampsonDistance(e: [Double], x1: SIMD2<Double>, x2: SIMD2<Double>) -> Double {
+    public static func sampsonDistance(e: [Double], x1: SIMD2<Double>, x2: SIMD2<Double>) -> Double {
         let a = SIMD3<Double>(x1.x, x1.y, 1)
         let b = SIMD3<Double>(x2.x, x2.y, 1)
         let ea = LinearAlgebra.matVec3(e, a)

@@ -249,14 +249,37 @@ Implemented:
       the sweep CEILING (1.5 px noise -> 1.90x, worse than the 0.80x it managed
       before). Reverted.
 
-    Conclusion: **triangulated point count is the wrong score.** Any threshold
-    policy biases it in one direction or the other, because the score is a count
-    of whatever the gate admits. The fix needs a threshold-free criterion — a
-    robust median epipolar error in pixels over all matches, or the
-    fundamental-matrix asymmetry route (fit F once from pixels, minimise the
-    singular-value asymmetry of E = KᵀFK), which is now cheap to evaluate
-    properly because the synthetic harness can say immediately whether a
-    candidate criterion has an interior minimum at the true focal.
+    **Rewritten using the harness. Now STABLE, still BIASED.**
+
+    Plotting the score curves against a known focal was decisive. Both
+    candidate criteria (median epipolar error; essential-matrix asymmetry) form
+    a sharp V with the minimum exactly at the truth on clean data — but at
+    1.5 px of keypoint noise the curve goes nearly FLAT (error varies 4.4-4.7 px
+    across the entire focal range). Focal is only weakly observable from one
+    noisy pair, so no single-pair criterion, however clever, can work. That is
+    an observability limit, not a scoring bug.
+
+    The estimator therefore now: fits F once per pair from pixel coordinates
+    (calibration-independent), scores a threshold-free median epipolar error
+    over the F inliers, normalises each pair's curve by its own median, and
+    SUMS across ~24 pairs so the shared true minimum reinforces while
+    independent noise averages out.
+
+    Result on the real capture: **0.50x at `--target` 24, 40 and 60** — the same
+    answer every time, where the old estimator gave 0.50x, 0.58x, 0.75x, 0.85x
+    and 0.90x on the same footage. Measurements are repeatable again, which was
+    the point.
+
+    **Remaining defect: a systematic UNDERestimate.** On synthetic pairs at
+    1.5 px noise it returns 0.58x for a true 0.65x, 0.65x for 0.80x, and 0.90x
+    for 1.10x — tracking the truth but biased ~11-19% low. Real 4K footage is
+    noisier still, so it lands on 0.50x (the sweep floor) against a true ~0.72x.
+    Scoring in normalised rather than pixel units removed part of the bias (the
+    pixel-error curve is steeply asymmetric — 2.88 at 0.5x versus 21.65 at 1.9x
+    — so a noise floor slides the minimum toward the flatter low side), but not
+    all of it. Next step: characterise the residual bias against noise level in
+    the harness and correct or reparameterise it; the tests to do that now
+    exist.
 
     **Resolved (was: 25/60 vs 29/60 from an identical binary).** Root cause was
     the registration queue: `remaining.sorted { support > support }` sorted a

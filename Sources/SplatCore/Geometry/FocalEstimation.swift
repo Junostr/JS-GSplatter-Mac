@@ -39,6 +39,75 @@ public struct FocalEstimate {
 
 public enum FocalEstimation {
 
+    /// Candidate scoring criteria, exposed so the synthetic harness can plot
+    /// each one's curve and confirm it actually has a minimum at the true
+    /// focal before it is trusted on real footage.
+    public enum Criterion: String {
+        /// Count of triangulated points (the original). Threshold-biased.
+        case pointCount
+        /// Median Sampson epipolar error, in pixels, over ALL matches.
+        /// Threshold-free: no gate, so nothing to bias the score, and the
+        /// median tolerates up to 50% outliers.
+        case medianEpipolarError
+        /// Singular-value asymmetry of E = KᵀFK for an F fitted once from
+        /// pixel coordinates.
+        case asymmetry
+    }
+
+    /// Score one calibration under one criterion. Lower is better for
+    /// `medianEpipolarError` and `asymmetry`; higher is better for
+    /// `pointCount` (negated here so every criterion minimises).
+    public static func score(
+        criterion: Criterion,
+        fundamental: [Double]?,
+        pixels1: [SIMD2<Double>], pixels2: [SIMD2<Double>],
+        intrinsics: CameraIntrinsics
+    ) -> Double? {
+        switch criterion {
+        case .asymmetry:
+            guard let f = fundamental else { return nil }
+            return TwoViewGeometry.calibrationAsymmetry(fundamental: f, intrinsics: intrinsics)
+        case .medianEpipolarError:
+            guard let f = fundamental else { return nil }
+            // Sampson distance under the essential matrix implied by this K,
+            // measured in PIXELS over every match. No inlier gate is involved,
+            // so no threshold policy can tilt the comparison.
+            let k: [Double] = [intrinsics.focalLength, 0, intrinsics.cx,
+                               0, intrinsics.focalLength, intrinsics.cy,
+                               0, 0, 1]
+            let kInv: [Double] = [1 / intrinsics.focalLength, 0, -intrinsics.cx / intrinsics.focalLength,
+                                  0, 1 / intrinsics.focalLength, -intrinsics.cy / intrinsics.focalLength,
+                                  0, 0, 1]
+            let e = LinearAlgebra.matMul3(LinearAlgebra.transpose3(k), LinearAlgebra.matMul3(f, k))
+            // Force the essential structure (s, s, 0), then map back to pixels.
+            let (u, _, vt) = LinearAlgebra.svd3x3(e)
+            let d: [Double] = [1, 0, 0, 0, 1, 0, 0, 0, 0]
+            let eIdeal = LinearAlgebra.matMul3(u, LinearAlgebra.matMul3(d, vt))
+            let fIdeal = LinearAlgebra.matMul3(LinearAlgebra.transpose3(kInv),
+                                               LinearAlgebra.matMul3(eIdeal, kInv))
+            var errors: [Double] = []
+            errors.reserveCapacity(pixels1.count)
+            for i in 0..<pixels1.count {
+                let d = TwoViewGeometry.sampsonDistance(e: fIdeal, x1: pixels1[i], x2: pixels2[i])
+                if d.isFinite { errors.append(d) }
+            }
+            guard !errors.isEmpty else { return nil }
+            // Divide by the candidate focal so the curve is measured in
+            // NORMALIZED units rather than pixels.
+            //
+            // Pixel error scales with focal, which makes the curve steeply
+            // asymmetric — measured on clean synthetic data it runs 2.88 at
+            // 0.5x but 21.65 at 1.9x around a true 0.80x. Any noise floor then
+            // slides the minimum toward the flatter low side, producing a
+            // systematic UNDERestimate (measured: -19% to -23% across three
+            // true focals, all biased the same direction). Normalizing removes
+            // the scale term the asymmetry comes from.
+            return errors.sorted()[errors.count / 2] / intrinsics.focalLength
+        case .pointCount:
+            return nil   // handled by the existing path
+        }
+    }
+
     /// Multipliers of the longer image side to try.
     ///
     /// Spans roughly 90 degrees horizontal FOV (0.5) down to 30 degrees (1.9),
@@ -51,11 +120,27 @@ public enum FocalEstimation {
         0.95, 1.00, 1.10, 1.20, 1.35, 1.55, 1.90,
     ]
 
-    /// Estimate focal length from the match graph.
+    /// Estimate focal length by AGGREGATING score curves across many pairs.
     ///
-    /// `pairs` should be a handful of well-matched frame pairs; sampling a few
-    /// rather than all of them keeps this to a fraction of a second, and the
-    /// signal is strong enough that more pairs do not change the answer.
+    /// The single-pair criterion is correct but weak. Measured on synthetic
+    /// pairs with a known 0.80x focal: with clean keypoints both the epipolar
+    /// error and the essential-matrix asymmetry form a sharp V with its minimum
+    /// exactly at the truth, but at 1.5 px of localisation noise the error curve
+    /// varies only 4.4-4.7 px across the ENTIRE focal range — a 7% spread. The
+    /// minimum is then decided by noise, not geometry, which is why one capture
+    /// returned 0.50x, 0.58x, 0.75x, 0.85x and 0.90x depending only on which
+    /// frames happened to be sampled.
+    ///
+    /// That is an observability problem, not a scoring bug, and no cleverer
+    /// single-pair criterion fixes it. The answer is more evidence: each pair
+    /// contributes a weak but independently-noisy curve, so normalising and
+    /// summing them lets the shared true minimum reinforce while the noise
+    /// averages out.
+    ///
+    /// Curves are normalised by their own median before summing. Absolute error
+    /// scale varies hugely between pairs (a wide-baseline pair has larger
+    /// residuals everywhere), so without normalisation a few high-error pairs
+    /// would dominate the sum and the aggregate would just track them.
     public static func estimate(
         pairs: [(keypoints1: [Keypoint], keypoints2: [Keypoint], matches: [FeatureMatch])],
         imageWidth: Int, imageHeight: Int,
@@ -65,71 +150,63 @@ public enum FocalEstimation {
         let longSide = Double(max(imageWidth, imageHeight))
         let cx = Double(imageWidth) / 2, cy = Double(imageHeight) / 2
 
-        var best: FocalEstimate?
-        for multiplier in multipliers {
-            let focal = multiplier * longSide
-            let intrinsics = CameraIntrinsics(focalLength: focal, cx: cx, cy: cy)
-            var totalPoints = 0
-            var errors: [Double] = []
+        var aggregate = [Double](repeating: 0, count: multipliers.count)
+        var contributing = 0
+        var totalSupport = 0
 
-            for pair in pairs {
-                guard pair.matches.count >= 16 else { continue }
-                guard let result = TwoViewGeometry.estimate(
-                    matches: pair.matches,
-                    keypoints1: pair.keypoints1, keypoints2: pair.keypoints2,
-                    intrinsics1: intrinsics, intrinsics2: intrinsics
-                ) else { continue }
-                totalPoints += result.points.count
-
-                // Reprojection error of the triangulated points in BOTH views.
-                // Point count alone can be gamed by a degenerate model that
-                // places everything at a plausible depth; requiring the points
-                // to also reproject tightly is what makes the score honest.
-                for (i, matchIndex) in result.pointMatchIndices.enumerated() {
-                    let match = pair.matches[matchIndex]
-                    guard match.queryIndex < pair.keypoints1.count,
-                          match.trainIndex < pair.keypoints2.count else { continue }
-                    let point = result.points[i]
-                    if let p1 = CameraPose.identity.project(point, intrinsics: intrinsics) {
-                        let kp = pair.keypoints1[match.queryIndex]
-                        errors.append(((p1.x - Double(kp.x)) * (p1.x - Double(kp.x))
-                                     + (p1.y - Double(kp.y)) * (p1.y - Double(kp.y))).squareRoot())
-                    }
-                    if let p2 = result.pose.project(point, intrinsics: intrinsics) {
-                        let kp = pair.keypoints2[match.trainIndex]
-                        errors.append(((p2.x - Double(kp.x)) * (p2.x - Double(kp.x))
-                                     + (p2.y - Double(kp.y)) * (p2.y - Double(kp.y))).squareRoot())
-                    }
-                }
+        for pair in pairs {
+            guard pair.matches.count >= 16 else { continue }
+            var px1: [SIMD2<Double>] = [], px2: [SIMD2<Double>] = []
+            for match in pair.matches {
+                guard match.queryIndex < pair.keypoints1.count,
+                      match.trainIndex < pair.keypoints2.count else { continue }
+                let a = pair.keypoints1[match.queryIndex], b = pair.keypoints2[match.trainIndex]
+                px1.append(SIMD2<Double>(Double(a.x), Double(a.y)))
+                px2.append(SIMD2<Double>(Double(b.x), Double(b.y)))
             }
+            guard px1.count >= 16,
+                  let f = TwoViewGeometry.fundamentalRANSAC(p1: px1, p2: px2) else { continue }
+            // Score only on the F inliers: gross mismatches carry no calibration
+            // information and would flatten the curve further.
+            let inlier1 = f.inliers.map { px1[$0] }
+            let inlier2 = f.inliers.map { px2[$0] }
+            guard inlier1.count >= 12 else { continue }
 
-            guard totalPoints > 0, !errors.isEmpty else { continue }
-            let median = errors.sorted()[errors.count / 2]
-            let candidate = FocalEstimate(
-                focalLength: focal, supportingPoints: totalPoints,
-                medianReprojectionError: median, candidatesTried: multipliers.count
-            )
-            // Prefer more surviving structure; break near-ties on lower
-            // reprojection error. The 5% band keeps a marginally larger point
-            // count from beating a clearly better-fitting model.
-            if let current = best {
-                let betterCount = Double(candidate.supportingPoints) > Double(current.supportingPoints) * 1.05
-                let comparableCount = Double(candidate.supportingPoints) >= Double(current.supportingPoints) * 0.95
-                if betterCount || (comparableCount && candidate.medianReprojectionError < current.medianReprojectionError) {
-                    best = candidate
-                }
-            } else {
-                best = candidate
+            var curve = [Double](repeating: 0, count: multipliers.count)
+            var usable = true
+            for (i, multiplier) in multipliers.enumerated() {
+                let intrinsics = CameraIntrinsics(focalLength: multiplier * longSide, cx: cx, cy: cy)
+                guard let value = score(criterion: .medianEpipolarError, fundamental: f.matrix,
+                                        pixels1: inlier1, pixels2: inlier2, intrinsics: intrinsics),
+                      value.isFinite else { usable = false; break }
+                curve[i] = value
             }
+            guard usable else { continue }
+            let median = curve.sorted()[curve.count / 2]
+            guard median > 1e-12 else { continue }
+            for i in curve.indices { aggregate[i] += curve[i] / median }
+            contributing += 1
+            totalSupport += inlier1.count
         }
-        return best
+
+        guard contributing > 0 else { return nil }
+        var bestIndex = 0
+        for i in aggregate.indices where aggregate[i] < aggregate[bestIndex] { bestIndex = i }
+        let focal = multipliers[bestIndex] * longSide
+        return FocalEstimate(
+            focalLength: focal,
+            supportingPoints: totalSupport,
+            medianReprojectionError: aggregate[bestIndex] / Double(contributing),
+
+            candidatesTried: multipliers.count
+        )
     }
 
     /// Convenience: pick the best-matched pairs out of a feature set list and
     /// estimate from those.
     public static func estimate(
         featureSets: [FeatureSet], imageWidth: Int, imageHeight: Int,
-        samplePairs: Int = 3, gaps: [Int] = [1, 2]
+        samplePairs: Int = 24, gaps: [Int] = [1, 2, 3]
     ) -> FocalEstimate? {
         guard featureSets.count >= 2 else { return nil }
         let ordered = featureSets.sorted { $0.frameIndex < $1.frameIndex }

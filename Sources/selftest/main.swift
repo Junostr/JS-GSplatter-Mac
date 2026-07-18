@@ -1136,6 +1136,90 @@ do {
     }
 }
 
+print("Focal estimation from MANY noisy pairs (the real-capture case):")
+do {
+    // The single-pair tests above are inherently weak: at realistic noise the
+    // score curve is nearly flat, so one pair cannot determine the focal. This
+    // is the case that matters — many pairs, each noisy, aggregated.
+    let width = 1920, height = 1080
+    let longSide = Double(max(width, height))
+    for trueMultiplier in [0.65, 0.80, 1.10] {
+        let intrinsics = CameraIntrinsics(focalLength: trueMultiplier * longSide,
+                                          cx: Double(width) / 2, cy: Double(height) / 2)
+        var rng = SplitMix64(seed: 4242)
+        var pairs: [(keypoints1: [Keypoint], keypoints2: [Keypoint], matches: [FeatureMatch])] = []
+        for p in 0..<14 {
+            let scene = makeSyntheticPair(
+                pointCount: 140,
+                rotationDegrees: 5 + Double(p % 4) * 2,
+                baseline: SIMD3<Double>(0.4 + Double(p % 3) * 0.15, 0.03, 0.02),
+                intrinsics: intrinsics, seed: UInt64(7000 + p))
+            func jitter(_ k: Keypoint) -> Keypoint {
+                Keypoint(x: k.x + Float(rng.nextGaussian()) * 1.5,
+                         y: k.y + Float(rng.nextGaussian()) * 1.5,
+                         response: k.response, angle: k.angle, octave: k.octave, scale: k.scale)
+            }
+            pairs.append((scene.kp1.map(jitter), scene.kp2.map(jitter), scene.matches))
+        }
+        guard let estimate = FocalEstimation.estimate(
+            pairs: pairs, imageWidth: width, imageHeight: height
+        ) else {
+            expect(false, "aggregated estimation returned a result for \(trueMultiplier)x")
+            continue
+        }
+        let got = estimate.focalLength / longSide
+        let relativeError = abs(got - trueMultiplier) / trueMultiplier
+        print(String(format: "      14 pairs @1.5px noise, true %.2fx -> %.2fx (%.0f%% error)",
+                     trueMultiplier, got, relativeError * 100))
+        expect(relativeError < 0.20,
+               "aggregation recovers \(trueMultiplier)x from noisy pairs (got \(got)x)")
+    }
+}
+
+print("Focal criterion curves (diagnostic):")
+do {
+    let width = 1920, height = 1080
+    let longSide = Double(max(width, height))
+    let trueMultiplier = 0.80
+    let intrinsics = CameraIntrinsics(focalLength: trueMultiplier * longSide,
+                                      cx: Double(width) / 2, cy: Double(height) / 2)
+    for sigma in [0.0, 1.5, 3.0] {
+        var rng = SplitMix64(seed: 606)
+        let scene = makeSyntheticPair(pointCount: 160, rotationDegrees: 7,
+                                      baseline: SIMD3<Double>(0.55, 0.04, 0.02),
+                                      intrinsics: intrinsics, seed: 321)
+        func jitter(_ k: Keypoint) -> Keypoint {
+            Keypoint(x: k.x + Float(rng.nextGaussian()) * Float(sigma),
+                     y: k.y + Float(rng.nextGaussian()) * Float(sigma),
+                     response: k.response, angle: k.angle, octave: k.octave, scale: k.scale)
+        }
+        let kp1 = scene.kp1.map(jitter), kp2 = scene.kp2.map(jitter)
+        var px1: [SIMD2<Double>] = [], px2: [SIMD2<Double>] = []
+        for m in scene.matches {
+            px1.append(SIMD2<Double>(Double(kp1[m.queryIndex].x), Double(kp1[m.queryIndex].y)))
+            px2.append(SIMD2<Double>(Double(kp2[m.trainIndex].x), Double(kp2[m.trainIndex].y)))
+        }
+        guard let f = TwoViewGeometry.fundamentalRANSAC(p1: px1, p2: px2) else { continue }
+        var asymLine = "", errLine = ""
+        var bestAsym = (Double.infinity, 0.0), bestErr = (Double.infinity, 0.0)
+        for m in FocalEstimation.defaultMultipliers {
+            let k = CameraIntrinsics(focalLength: m * longSide,
+                                     cx: Double(width) / 2, cy: Double(height) / 2)
+            let a = FocalEstimation.score(criterion: .asymmetry, fundamental: f.matrix,
+                                          pixels1: px1, pixels2: px2, intrinsics: k) ?? .infinity
+            let e = FocalEstimation.score(criterion: .medianEpipolarError, fundamental: f.matrix,
+                                          pixels1: px1, pixels2: px2, intrinsics: k) ?? .infinity
+            if a < bestAsym.0 { bestAsym = (a, m) }
+            if e < bestErr.0 { bestErr = (e, m) }
+            asymLine += String(format: "%.3f ", a)
+            errLine += String(format: "%.2f ", e)
+        }
+        print("      noise \(sigma) px, true \(trueMultiplier)x")
+        print("        asym:  \(asymLine) -> min at \(bestAsym.1)x")
+        print("        error: \(errLine) -> min at \(bestErr.1)x")
+    }
+}
+
 print("SIFT-like descriptor:")
 do {
     // A textured patch, and the SAME patch under a large global illumination
