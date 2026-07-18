@@ -566,5 +566,177 @@ do {
     expect(r5.selected.isEmpty, "empty input yields empty selection")
 }
 
+// MARK: - Stage 3: feature extraction and matching
+
+/// Scattered bright squares on a dark field: unambiguous corners at known
+/// locations, and shifting the whole pattern gives ground-truth correspondence.
+func makeCorners(width: Int, height: Int, offsetX: Int, offsetY: Int) -> CGImage {
+    let context = CGContext(
+        data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue
+    )!
+    context.setFillColor(CGColor(red: 0.08, green: 0.08, blue: 0.1, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    // Deterministic pseudo-scatter; varied sizes so responses differ and the
+    // strongest-first ordering is actually exercised.
+    var seed = 12345
+    func nextInt(_ bound: Int) -> Int {
+        seed = (seed &* 1103515245 &+ 12345) & 0x7FFF_FFFF
+        return seed % bound
+    }
+    for _ in 0..<40 {
+        let x = 30 + nextInt(width - 90) + offsetX
+        let y = 30 + nextInt(height - 90) + offsetY
+        let size = 8 + nextInt(10)
+        let shade = 0.55 + Double(nextInt(45)) / 100.0
+        context.setFillColor(CGColor(red: shade, green: shade * 0.95, blue: shade * 0.9, alpha: 1))
+        context.fill(CGRect(x: x, y: y, width: size, height: size))
+    }
+    return context.makeImage()!
+}
+
+print("Feature descriptor pattern (determinism):")
+do {
+    // The BRIEF pattern must be identical across runs and machines, or
+    // descriptors extracted today cannot match ones extracted yesterday.
+    expect(FeatureMath.pattern.count == 256, "pattern has 256 tests (got \(FeatureMath.pattern.count))")
+    let allInPatch = FeatureMath.pattern.allSatisfy { t in
+        let r = Int8(FeatureMath.patchRadius)
+        return t.dx1 >= -r && t.dx1 <= r && t.dy1 >= -r && t.dy1 <= r
+            && t.dx2 >= -r && t.dx2 <= r && t.dy2 >= -r && t.dy2 <= r
+    }
+    expect(allInPatch, "every sampling point lies inside the patch radius")
+    let degenerate = FeatureMath.pattern.contains { $0.dx1 == $0.dx2 && $0.dy1 == $0.dy2 }
+    expect(!degenerate, "no test compares a pixel with itself")
+    // Regenerating from the same fixed seed must reproduce the pattern.
+    var rng = SplitMix64(seed: 0x5F3A_9C21_7E44_B0D9)
+    let firstDraw = rng.next()
+    var rng2 = SplitMix64(seed: 0x5F3A_9C21_7E44_B0D9)
+    expect(rng2.next() == firstDraw, "SplitMix64 is reproducible from a fixed seed")
+}
+
+print("Feature extraction (Metal vs CPU parity):")
+do {
+    let featureDir = workDir.appendingPathComponent("features")
+    try FileManager.default.createDirectory(at: featureDir, withIntermediateDirectories: true)
+    writePNG(makeCorners(width: 320, height: 240, offsetX: 0, offsetY: 0),
+             to: featureDir.appendingPathComponent("a_base.png"))
+
+    let cpu = CPUFeatureExtractor()
+    let metal = try? MetalFeatureExtractor()
+    if metal == nil { print("  --  (no Metal device — GPU extractor tests skipped)") }
+
+    let source = try IngestionSource.detect(at: featureDir)
+    try FrameIngestor.ingest(source) { frame in
+        let options = FeatureOptions(maxFeatures: 500)
+        let c = try cpu.extract(index: frame.index, pixelBuffer: frame.pixelBuffer, options: options)
+        expect(c.count > 20, "CPU finds a meaningful number of corners (got \(c.count))")
+        expect(c.descriptors.count == c.count * FeatureSet.descriptorBytes,
+               "descriptor buffer size matches keypoint count")
+        // Responses arrive strongest-first, but only up to the sort's
+        // quantization grid: within one bucket the order is spatial, so the
+        // raw response may tick upward by less than one grid step. Asserting
+        // strict monotonicity would be asserting the bug the quantization
+        // deliberately fixes.
+        let responses = c.keypoints.map { $0.response }
+        let quantStep = (responses.first ?? 0) / Float(1 << 20)
+        let monotonic = zip(responses, responses.dropFirst()).allSatisfy { $1 <= $0 + quantStep * 2 }
+        expect(monotonic, "keypoints are ordered strongest-first (within the sort quantization step)")
+        expect(responses.first == responses.max(), "the first keypoint is the global maximum")
+
+        if let metal = metal {
+            let m = try metal.extract(index: frame.index, pixelBuffer: frame.pixelBuffer, options: options)
+            expect(m.count == c.count, "same keypoint count across tiers (CPU \(c.count), Metal \(m.count))")
+            // The contract is that the two tiers produce INTERCHANGEABLE
+            // feature sets, matched by position — not bit-identical array
+            // ordering. The response maps legitimately differ by ~1 ULP
+            // (see the sort-quantization note in FeatureExtraction.swift),
+            // and demanding identical ordering across heterogeneous GPUs
+            // would be a promise we cannot keep on real Nvidia/AMD hardware.
+            // NMS guarantees unique positions, but uniquing defensively keeps
+            // a duplicate from trapping the whole suite.
+            let cByPos = Dictionary(c.keypoints.enumerated().map { ("\($1.x)|\($1.y)", $0) },
+                                    uniquingKeysWith: { first, _ in first })
+            let mByPos = Dictionary(m.keypoints.enumerated().map { ("\($1.x)|\($1.y)", $0) },
+                                    uniquingKeysWith: { first, _ in first })
+            expect(Set(cByPos.keys) == Set(mByPos.keys),
+                   "identical keypoint SETS across tiers (\(Set(cByPos.keys).intersection(mByPos.keys).count)/\(c.count) shared)")
+
+            // For every shared keypoint, orientation and descriptor must match
+            // exactly — these are computed by shared code from the same luma,
+            // so any difference here would be a real defect.
+            var maxAngleDiff: Float = 0
+            var descriptorMismatches = 0
+            for (key, ci) in cByPos {
+                guard let mi = mByPos[key] else { continue }
+                maxAngleDiff = Swift.max(maxAngleDiff, abs(c.keypoints[ci].angle - m.keypoints[mi].angle))
+                if Array(c.descriptor(at: ci)) != Array(m.descriptor(at: mi)) { descriptorMismatches += 1 }
+            }
+            expect(maxAngleDiff < 1e-4, "identical orientations for shared keypoints (max Δ \(maxAngleDiff))")
+            expect(descriptorMismatches == 0, "bit-identical descriptors for shared keypoints (\(descriptorMismatches) mismatched)")
+
+            // Ordering is quantization-stabilized, so it should also agree in
+            // practice; report it rather than asserting it, since it is a
+            // best-effort property across GPU vendors, not a guarantee.
+            let sameOrder = zip(c.keypoints, m.keypoints).filter { $0.x == $1.x && $0.y == $1.y }.count
+            print("      order agreement: \(sameOrder)/\(c.count) positions in identical rank")
+        }
+        return true
+    }
+}
+
+print("Feature matching (recovers a known translation):")
+do {
+    let matchDir = workDir.appendingPathComponent("matching")
+    try FileManager.default.createDirectory(at: matchDir, withIntermediateDirectories: true)
+    let shift = 12
+    writePNG(makeCorners(width: 320, height: 240, offsetX: 0, offsetY: 0),
+             to: matchDir.appendingPathComponent("a_frame0.png"))
+    writePNG(makeCorners(width: 320, height: 240, offsetX: shift, offsetY: 0),
+             to: matchDir.appendingPathComponent("b_frame1.png"))
+
+    let extractor = FeatureExtractorFactory.make()
+    var sets: [FeatureSet] = []
+    let source = try IngestionSource.detect(at: matchDir)
+    try FrameIngestor.ingest(source) { frame in
+        sets.append(try extractor.extract(index: frame.index, pixelBuffer: frame.pixelBuffer,
+                                          options: FeatureOptions(maxFeatures: 500)))
+        return true
+    }
+    expect(sets.count == 2, "two frames extracted")
+
+    let matches = FeatureMatcher.match(query: sets[0], train: sets[1])
+    expect(matches.count > 15, "matcher finds a usable number of correspondences (got \(matches.count))")
+
+    // Ground truth: frame 1 is frame 0 shifted right by `shift` px. Note the
+    // CGContext y-axis is bottom-up while keypoints are top-down, so only the
+    // x-shift is asserted directionally; dy must simply be ~0.
+    let dxs = matches.map { sets[1].keypoints[$0.trainIndex].x - sets[0].keypoints[$0.queryIndex].x }
+    let dys = matches.map { sets[1].keypoints[$0.trainIndex].y - sets[0].keypoints[$0.queryIndex].y }
+    let correct = zip(dxs, dys).filter { abs($0 - Float(shift)) < 1.5 && abs($1) < 1.5 }.count
+    let fraction = Double(correct) / Double(matches.count)
+    print(String(format: "      %d matches, %.0f%% recover the true (+%d, 0) shift", matches.count, fraction * 100, shift))
+    expect(fraction > 0.85, "≥85% of matches recover the ground-truth shift (got \(Int(fraction * 100))%)")
+
+    // Self-matching must be perfect and identity.
+    let selfMatches = FeatureMatcher.match(query: sets[0], train: sets[0])
+    let identity = selfMatches.allSatisfy { $0.queryIndex == $0.trainIndex && $0.distance == 0 }
+    expect(identity, "matching a frame against itself yields identity at distance 0")
+
+    // Degenerate inputs must not crash.
+    let empty = FeatureSet(frameIndex: 0, keypoints: [], descriptors: [])
+    expect(FeatureMatcher.match(query: empty, train: sets[0]).isEmpty, "empty query yields no matches")
+    expect(FeatureMatcher.match(query: sets[0], train: empty).isEmpty, "empty train yields no matches")
+}
+
+print("Hamming distance:")
+do {
+    let a: [UInt8] = [0b0000_0000, 0xFF]
+    let b: [UInt8] = [0b0000_1111, 0xFF]
+    expect(FeatureMatcher.hamming(a[0...1], b[0...1]) == 4, "hamming counts differing bits")
+    expect(FeatureMatcher.hamming(a[0...1], a[0...1]) == 0, "hamming of a value with itself is 0")
+}
+
 print("\n\(passed) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)
