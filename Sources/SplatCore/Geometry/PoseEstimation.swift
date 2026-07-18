@@ -12,8 +12,16 @@ public struct PnPOptions {
     public var seed: UInt64
     public var minInliers: Int
 
-    public init(inlierThresholdPixels: Double = 4.0, maxIterations: Int = 500,
-                seed: UInt64 = 0xBF58_476D_1CE4_E5B9, minInliers: Int = 12) {
+    /// Defaults are deliberately permissive. A camera being registered is
+    /// matched against points triangulated from an initial pair, so those
+    /// points still carry real depth uncertainty — a tight gate here rejects
+    /// frames that would have been fine once bundle adjustment tightened the
+    /// structure, and a reconstruction that cannot grow never gets that chance.
+    /// Measured on a real capture with a 4 px / 12-inlier gate: PnP failed on
+    /// EVERY frame despite 13-34 correspondences being available. BA plus its
+    /// outlier rejection is the right place to be strict, not here.
+    public init(inlierThresholdPixels: Double = 8.0, maxIterations: Int = 2000,
+                seed: UInt64 = 0xBF58_476D_1CE4_E5B9, minInliers: Int = 8) {
         self.inlierThresholdPixels = inlierThresholdPixels
         self.maxIterations = maxIterations
         self.seed = seed

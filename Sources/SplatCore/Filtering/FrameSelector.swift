@@ -105,7 +105,31 @@ public enum FrameSelector {
             for bucket in 0..<target {
                 let start = bucket * deduped.count / target
                 let end = (bucket + 1) * deduped.count / target
-                if let best = deduped[start..<end].max(by: { $0.blurScore < $1.blurScore }) {
+                guard end > start else { continue }
+                // Search only the CENTRAL portion of each bucket.
+                //
+                // Taking the sharpest frame anywhere in the bucket lets two
+                // consecutive buckets pick frames on either side of their
+                // shared boundary — producing selected frames that are
+                // adjacent in the original video while every other pair is a
+                // full bucket apart. That wrecks downstream SfM: the initial
+                // pair is chosen for having the most matches, adjacent frames
+                // always win that, and the resulting near-zero baseline gives
+                // points too shallow to register any other camera against.
+                // Measured on a real capture: seed frames 4 apart, nearest
+                // other frame 20 apart, and PnP then failed on every single
+                // frame despite having 13-34 correspondences available.
+                //
+                // Restricting to the middle 60% guarantees a minimum spacing
+                // of ~40% of a bucket between picks, at the cost of sometimes
+                // taking a slightly less sharp frame — a good trade, since
+                // even coverage matters more to reconstruction than the last
+                // few percent of sharpness.
+                let span = end - start
+                let inset = span >= 5 ? span / 5 : 0
+                let searchStart = start + inset
+                let searchEnd = max(searchStart + 1, end - inset)
+                if let best = deduped[searchStart..<searchEnd].max(by: { $0.blurScore < $1.blurScore }) {
                     picked.append(best)
                 }
             }

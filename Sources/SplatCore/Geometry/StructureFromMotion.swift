@@ -273,9 +273,9 @@ public enum StructureFromMotion {
             for frame in ordered {
                 guard let intr = intrinsics[frame], let keypoints = keypointsByFrame[frame] else { continue }
                 let c = correspondences(for: frame)
-                guard c.world.count >= 6,
-                      let pnp = PoseEstimation.estimatePose(worldPoints: c.world, imagePoints: c.image,
-                                                            intrinsics: intr)
+                guard c.world.count >= 6 else { continue }
+                guard let pnp = PoseEstimation.estimatePose(worldPoints: c.world, imagePoints: c.image,
+                                                           intrinsics: intr)
                 else { continue }
 
                 reconstruction.cameras[frame] = RegisteredCamera(frameIndex: frame, pose: pnp.pose, intrinsics: intr)
