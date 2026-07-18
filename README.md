@@ -178,8 +178,35 @@ Implemented:
     distance, and applying it unsquared to squared distances would silently
     impose a much stricter 0.894 and discard many correct matches.
 
-    Registration reaches roughly half the orbit. Late-orbit PnP ratios still
-    decay, consistent with accumulating drift at the widest viewpoint changes.
+    Registration reaches roughly half the orbit (29/60). Late-orbit PnP ratios
+    still decay, consistent with accumulating drift at the widest viewpoint
+    changes.
+
+    **Loop closure is implemented but OFF by default** (`SfMOptions.loopClosure`)
+    because it is not yet shown to help. The mechanism works: a cheap probe on
+    the strongest ~120 descriptors scores every pair beyond the sliding window,
+    the best 30 get fully matched, and on the real capture that finds 126
+    candidates and adds 30 long-range pairs. But enabling it did not improve
+    reconstruction, and one measurement was substantially worse. Shipping it on
+    by default would risk silently degrading results, so it is opt-in until
+    there is evidence it earns its place.
+
+    Two things were fixed getting that far, and both are worth keeping:
+    - A reversed-range trap. For the last `matchWindow + 1` frames the inner
+      loop's start index exceeds the frame count, and `25..<24` is a Swift
+      precondition failure rather than an empty sequence — the whole run
+      crashed with SIGTRAP. (Same trap class as the degenerate-dimension bug in
+      `CPUFrameAnalyzer`.)
+    - Loop pairs must be excluded from INITIAL-PAIR candidacy. They are by
+      construction the widest-baseline pairs in the graph, so they flood the
+      bounded seed-candidate pool and starve it of the moderate baselines that
+      seed well; with them included the seed search reported "no pair had
+      enough parallax" and failed outright.
+
+    Also unresolved and probably prior to loop closure: focal estimation is
+    frame-set sensitive — the same capture estimated 0.58x, 0.75x and 0.90x of
+    the long side at different `--target` values, and a bad focal degrades
+    everything downstream.
 
     **Resolved (was: 25/60 vs 29/60 from an identical binary).** Root cause was
     the registration queue: `remaining.sorted { support > support }` sorted a

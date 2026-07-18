@@ -27,9 +27,38 @@ public struct SfMOptions {
     /// cameras. Keeps structure tight so later PnP stays well conditioned.
     public var bundleEveryNCameras: Int
 
+    /// Search for LOOP-CLOSURE pairs: frames far apart in the sequence that
+    /// nonetheless see the same surfaces, which is what happens when an orbit
+    /// comes back round to where it started.
+    ///
+    /// The sliding match window deliberately never pairs frame 0 with frame 59,
+    /// so without this those links do not exist in the match graph at all —
+    /// the reconstruction is a chain that can only accumulate drift, never a
+    /// loop that can correct it. Guided matching links any two POSED cameras,
+    /// but that cannot bootstrap the far side of an orbit, because those frames
+    /// need correspondences before they can be posed in the first place.
+    public var loopClosure: Bool
+    /// Descriptors per frame used for the cheap overlap probe. Full matching on
+    /// every long-range pair is O(n²) over thousands of 128-byte descriptors
+    /// and far too slow; probing the strongest few is enough to tell whether a
+    /// pair is worth the full comparison.
+    public var loopProbeFeatures: Int
+    /// Probe matches required before a pair earns a full match.
+    public var loopMinProbeMatches: Int
+    /// Cap on fully-matched loop pairs, strongest probe first. A loop needs
+    /// only a handful of good links to close; matching every candidate in full
+    /// does not finish in reasonable time.
+    public var maxLoopPairs: Int
+
     public init(matchWindow: Int = 6, maxFeaturesPerFrame: Int = 1500,
                 minPairInliers: Int = 30, minInitialAngleDegrees: Double = 1.2,
-                bundleAdjust: Bool = true, bundleEveryNCameras: Int = 3) {
+                bundleAdjust: Bool = true, bundleEveryNCameras: Int = 3,
+                loopClosure: Bool = false, loopProbeFeatures: Int = 120,
+                loopMinProbeMatches: Int = 8, maxLoopPairs: Int = 30) {
+        self.maxLoopPairs = maxLoopPairs
+        self.loopClosure = loopClosure
+        self.loopProbeFeatures = loopProbeFeatures
+        self.loopMinProbeMatches = loopMinProbeMatches
         self.matchWindow = matchWindow
         self.maxFeaturesPerFrame = maxFeaturesPerFrame
         self.minPairInliers = minPairInliers
@@ -82,6 +111,91 @@ public enum StructureFromMotion {
         }
         guard !pairMatches.isEmpty else { return nil }
         log?("matched \(pairMatches.count) frame pairs")
+
+        // Loop pairs are excluded from INITIAL-PAIR candidacy below. They are
+        // by construction the widest-baseline pairs in the graph, so they flood
+        // the bounded seed-candidate pool and starve it of the moderate
+        // baselines that actually seed well — measured: adding them made the
+        // seed search report "no pair had enough parallax" and fail outright.
+        // Their job is to close a loop once it exists, not to start one.
+        var loopPairs: Set<Pair> = []
+
+        // 1b. Loop-closure candidates: pairs beyond the sliding window.
+        //
+        // Two-stage by necessity. A full descriptor match on every long-range
+        // pair is O(n²) over thousands of 128-dimension descriptors — with 60
+        // frames that is ~1500 pairs of ~1500x1500 comparisons, which is far
+        // too slow. Probing only the strongest `loopProbeFeatures` descriptors
+        // costs a fraction of that and is a reliable filter: frames that truly
+        // revisit a viewpoint match strongly even on a small subset, while
+        // unrelated frames produce almost nothing.
+        if options.loopClosure && frames.count > options.matchWindow + 2 {
+            func probeSet(_ set: FeatureSet, _ limit: Int) -> FeatureSet {
+                guard set.count > limit else { return set }
+                // Keypoints arrive strongest-first, so a prefix is the top-N.
+                let bytes = set.kind.byteCount
+                return FeatureSet(
+                    frameIndex: set.frameIndex,
+                    keypoints: Array(set.keypoints.prefix(limit)),
+                    descriptors: Array(set.descriptors.prefix(limit * bytes)),
+                    kind: set.kind
+                )
+            }
+            var probes: [Int: FeatureSet] = [:]
+            for frame in frames {
+                if let set = setsByFrame[frame] { probes[frame] = probeSet(set, options.loopProbeFeatures) }
+            }
+
+            // Score every long-range pair with the cheap probe, then fully
+            // match only the strongest few.
+            //
+            // Accepting every pair that passes the probe is not viable: full
+            // matching is ~1500x1500 comparisons of 128-byte descriptors, and
+            // with hundreds of qualifying pairs the search never finishes. A
+            // loop only needs a handful of good links to close — the whole
+            // point is to tie the ends together, not to re-match everything.
+            var candidates: [(pair: Pair, score: Int)] = []
+            var loopPairsAdded: Set<Pair> = []
+            for i in 0..<frames.count {
+                // Guard the lower bound: for the last `matchWindow + 1` frames
+                // this start index exceeds the count, and `25..<24` is a
+                // REVERSED range, which Swift traps on rather than treating as
+                // empty. Same trap class as the degenerate-dimension crash in
+                // CPUFrameAnalyzer — a reversed Range is a precondition
+                // failure, not an empty sequence.
+                let start = i + options.matchWindow + 1
+                guard start < frames.count else { continue }
+                for j in start..<frames.count {
+                    let a = frames[i], b = frames[j]
+                    guard pairMatches[Pair(a, b)] == nil,
+                          let pa = probes[a], let pb = probes[b] else { continue }
+                    let probe = FeatureMatcher.match(query: pa, train: pb)
+                    if probe.count >= options.loopMinProbeMatches {
+                        candidates.append((Pair(a, b), probe.count))
+                    }
+                }
+            }
+            // Sort by probe strength, with the pair as a total-order tiebreak
+            // so the selection cannot depend on container iteration order.
+            candidates.sort {
+                $0.score != $1.score ? $0.score > $1.score : ($0.pair.a, $0.pair.b) < ($1.pair.a, $1.pair.b)
+            }
+            var found = 0
+            for candidate in candidates.prefix(options.maxLoopPairs) {
+                guard let fa = setsByFrame[candidate.pair.a], let fb = setsByFrame[candidate.pair.b] else { continue }
+                let full = FeatureMatcher.match(query: fa, train: fb)
+                if full.count >= 8 {
+                    pairMatches[candidate.pair] = full
+                    loopPairsAdded.insert(candidate.pair)
+                    found += 1
+                }
+            }
+            if !candidates.isEmpty {
+                log?("loop closure: \(candidates.count) candidates, \(found) added")
+            }
+            loopPairs = loopPairsAdded
+
+        }
 
         // 2. Build tracks by union-find over (frame, keypoint) observations.
         var unionFind = UnionFind()
@@ -157,7 +271,7 @@ public enum StructureFromMotion {
         // then picks among genuinely different options.
         let orderedFrameIndex = Dictionary(uniqueKeysWithValues: frames.enumerated().map { ($1, $0) })
         var bySeparation: [Int: [(key: Pair, value: [FeatureMatch])]] = [:]
-        for (pair, matches) in pairMatches {
+        for (pair, matches) in pairMatches where !loopPairs.contains(pair) {
             let separation = abs((orderedFrameIndex[pair.b] ?? 0) - (orderedFrameIndex[pair.a] ?? 0))
             bySeparation[separation, default: []].append((pair, matches))
         }
