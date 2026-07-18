@@ -85,7 +85,12 @@ public enum StructureFromMotion {
 
         // 2. Build tracks by union-find over (frame, keypoint) observations.
         var unionFind = UnionFind()
-        for (pair, matches) in pairMatches {
+        // Sorted: union order decides which observation becomes a set's root.
+        // The resulting PARTITION is order-independent, but the roots are not,
+        // and tracks are keyed by root — so leaving this to Dictionary order
+        // would make the track table vary per process for no benefit.
+        for pair in pairMatches.keys.sorted(by: { ($0.a, $0.b) < ($1.a, $1.b) }) {
+            let matches = pairMatches[pair]!
             for match in matches {
                 unionFind.union(Observation(frame: pair.a, keypoint: match.queryIndex),
                                 Observation(frame: pair.b, keypoint: match.trainIndex))
@@ -418,7 +423,24 @@ public enum StructureFromMotion {
                 return (world, image, kpIndices)
             }
 
-            let ordered = remaining.sorted { correspondences(for: $0).world.count > correspondences(for: $1).world.count }
+            // Total order, and counts computed ONCE.
+            //
+            // Two independent bugs lived in the previous one-liner. It sorted a
+            // Set — whose iteration order Swift randomizes per process — and
+            // Swift's sort is NOT stable, so any tie in correspondence count
+            // resolved arbitrarily. Since the loop registers only the first
+            // frame and then restarts, a tie decided which camera joined next,
+            // and that choice cascades through every later registration.
+            // Proven: SWIFT_DETERMINISTIC_HASHING=1 gave 29/60 registered
+            // cameras where the default gave 25/60, on an identical binary.
+            // It also called correspondences() inside the comparator, which is
+            // O(n log n) recomputations of an expensive function AND risks an
+            // inconsistent comparator if the value could ever vary mid-sort —
+            // undefined behaviour for sort().
+            let ordered = remaining
+                .map { (frame: $0, support: correspondences(for: $0).world.count) }
+                .sorted { $0.support != $1.support ? $0.support > $1.support : $0.frame < $1.frame }
+                .map { $0.frame }
             for frame in ordered {
                 guard let intr = intrinsics[frame], let keypoints = keypointsByFrame[frame] else { continue }
                 let c = correspondences(for: frame)

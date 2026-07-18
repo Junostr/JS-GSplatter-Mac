@@ -181,12 +181,27 @@ Implemented:
     Registration reaches roughly half the orbit. Late-orbit PnP ratios still
     decay, consistent with accumulating drift at the widest viewpoint changes.
 
-    **Unresolved:** the A/B above measured 25/60 for SIFT, while two
-    back-to-back runs immediately afterwards both gave 29/60 with an unchanged
-    binary. Consecutive runs are reproducible, so the earlier sorted-iteration
-    fix did help, but this discrepancy is unexplained and suggests some residual
-    run-to-run variability remains. Worth chasing before trusting any small
-    measured difference in this pipeline.
+    **Resolved (was: 25/60 vs 29/60 from an identical binary).** Root cause was
+    the registration queue: `remaining.sorted { support > support }` sorted a
+    **Set** — whose iteration order Swift randomizes per process — using a
+    comparator that only compared support counts, and Swift's sort is **not
+    stable**. Any tie therefore resolved arbitrarily, and since the loop
+    registers only the first frame before restarting, one tie decided which
+    camera joined next and cascaded through every later registration.
+
+    Proven rather than guessed: `SWIFT_DETERMINISTIC_HASHING=1` produced 29/60
+    where the default produced 25/60 on the same binary. After adding a total
+    order (support, then frame index) and computing each support count once
+    instead of inside the comparator, both hashing modes agree at 29/60 — and
+    29 was the correct answer all along. Union-find construction was also
+    pinned to a sorted pair order, since union order decides set roots and
+    tracks are keyed by root.
+
+    Note the existing "reproducible across runs" test could not catch this: the
+    hash seed is fixed for a process lifetime, so running twice in-process
+    proves nothing about hash-order dependence. The new guard reconstructs from
+    **shuffled input feature sets**, which perturbs the order data lands in
+    every internal Set and Dictionary and fails if any dependence survives.
 
     Practical note meanwhile: prefer `--target 60` or higher on real captures.
     Denser sampling costs little and matters more than any tuning knob here.

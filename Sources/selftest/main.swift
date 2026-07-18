@@ -1336,6 +1336,29 @@ do {
         return rotationAngleBetween(a.pose.rotation, b.pose.rotation) < 1e-9
     }
     expect(samePoses, "SfM camera poses are identical across runs")
+
+    // Input-ORDER independence. Re-running in the same process cannot catch
+    // hash-order bugs, because the process hash seed is fixed for its lifetime
+    // — which is exactly why the existing check above passed while the real
+    // pipeline gave 25/60 registered cameras on one process and 29/60 on
+    // another. Shuffling the input feature sets perturbs the order data lands
+    // in every internal Set and Dictionary, so any surviving dependence on
+    // container iteration order shows up here as a different reconstruction.
+    guard let (shuffled, shuffledReport) = StructureFromMotion.reconstruct(
+        featureSets: featureSets.shuffled(), intrinsics: intrinsicsByFrame,
+        options: SfMOptions(matchWindow: 3, minPairInliers: 30, minInitialAngleDegrees: 1.0)
+    ) else {
+        expect(false, "shuffled-input SfM produced a reconstruction")
+        exit(1)
+    }
+    expect(shuffledReport.points == report.points
+           && shuffledReport.registeredCameras == report.registeredCameras,
+           "SfM is independent of input frame ORDER (\(report.points) vs \(shuffledReport.points) points)")
+    let sameShuffledPoses = orderedFrames.allSatisfy { frame in
+        guard let a = reconstruction.cameras[frame], let b = shuffled.cameras[frame] else { return false }
+        return rotationAngleBetween(a.pose.rotation, b.pose.rotation) < 1e-9
+    }
+    expect(sameShuffledPoses, "SfM poses are identical regardless of input order")
 }
 
 print("\n\(passed) passed, \(failures) failed")
