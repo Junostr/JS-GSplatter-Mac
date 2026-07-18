@@ -1005,6 +1005,63 @@ do {
            "fewer than 8 matches yields no result")
 }
 
+print("Guided epipolar matching:")
+do {
+    let intrinsics = CameraIntrinsics(focalLength: 1200, cx: 960, cy: 540)
+    let scene = makeSyntheticPair(pointCount: 90, rotationDegrees: 7,
+                                  baseline: SIMD3<Double>(0.55, 0.03, 0), intrinsics: intrinsics, seed: 4242)
+
+    // Descriptors that are deliberately AMBIGUOUS: every point gets one of
+    // only 6 distinct patterns, so many features look alike and the plain
+    // ratio test throws most of them away. This is the situation guided
+    // matching exists for — wide-viewpoint frames where appearance is no
+    // longer distinctive on its own.
+    var rng = SplitMix64(seed: 11)
+    var patterns: [[UInt8]] = []
+    for _ in 0..<6 {
+        var d = [UInt8](repeating: 0, count: FeatureSet.descriptorBytes)
+        for b in 0..<FeatureSet.descriptorBytes { d[b] = UInt8(rng.next() & 0xFF) }
+        patterns.append(d)
+    }
+    var descriptors1: [UInt8] = [], descriptors2: [UInt8] = []
+    for i in 0..<scene.kp1.count {
+        descriptors1.append(contentsOf: patterns[i % 6])
+        descriptors2.append(contentsOf: patterns[i % 6])
+    }
+    let set1 = FeatureSet(frameIndex: 0, keypoints: scene.kp1, descriptors: descriptors1)
+    let set2 = FeatureSet(frameIndex: 1, keypoints: scene.kp2, descriptors: descriptors2)
+
+    let plain = FeatureMatcher.match(query: set1, train: set2)
+    let guided = FeatureMatcher.matchGuided(
+        query: set1, train: set2,
+        queryPose: .identity, trainPose: scene.pose2,
+        queryIntrinsics: intrinsics, trainIntrinsics: intrinsics
+    )
+    // Ground truth is index-to-index by construction.
+    let plainCorrect = plain.filter { $0.queryIndex == $0.trainIndex }.count
+    let guidedCorrect = guided.filter { $0.queryIndex == $0.trainIndex }.count
+    print("      ambiguous descriptors: plain \(plainCorrect)/\(plain.count) correct, guided \(guidedCorrect)/\(guided.count)")
+
+    expect(guided.count > plain.count,
+           "guided matching recovers more correspondences (\(guided.count) vs \(plain.count))")
+    expect(guidedCorrect > plainCorrect,
+           "guided matching recovers more CORRECT correspondences (\(guidedCorrect) vs \(plainCorrect))")
+    let precision = guided.isEmpty ? 0 : Double(guidedCorrect) / Double(guided.count)
+    expect(precision > 0.9, "guided matches stay precise (\(Int(precision * 100))%)")
+
+    // A wrong pose must NOT produce a confident match set — the epipolar
+    // constraint has to be doing real work, not rubber-stamping everything.
+    let wrongPose = CameraPose(rotation: rotationAboutY(75), translation: SIMD3<Double>(2, 1, 0.5))
+    let bogus = FeatureMatcher.matchGuided(
+        query: set1, train: set2,
+        queryPose: .identity, trainPose: wrongPose,
+        queryIntrinsics: intrinsics, trainIntrinsics: intrinsics
+    )
+    let bogusCorrect = bogus.filter { $0.queryIndex == $0.trainIndex }.count
+    expect(bogusCorrect < guidedCorrect / 2,
+           "a wrong pose does not yield correct matches (\(bogusCorrect) vs \(guidedCorrect))")
+}
+
 print("Bundle adjustment:")
 do {
     let intrinsics = CameraIntrinsics(focalLength: 1200, cx: 960, cy: 540)

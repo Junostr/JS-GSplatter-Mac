@@ -245,9 +245,53 @@ public enum StructureFromMotion {
         // Register remaining frames, most-supported first. Support and
         // correspondence both come from PAIRWISE matches against already
         // registered frames, not from global tracks.
+        // Guided matches, keyed by pair, computed once both cameras are posed.
+        //
+        // These serve two purposes at once. Densification: the plain ratio test
+        // has to be conservative with no geometric context and discards many
+        // correct correspondences, exactly where appearance has changed most —
+        // the wide viewpoint changes late in an orbit. And LOOP CLOSURE: the
+        // sliding match window never pairs the end of an orbit with its start,
+        // but once both ends are registered the epipolar constraint links them
+        // directly, which is what stops drift accumulating all the way round.
+        var refinedMatches: [Pair: [FeatureMatch]] = [:]
+
+        /// Matches to use for structure growth: guided if both cameras are
+        /// posed, otherwise the plain windowed matches.
+        func matchesFor(_ a: Int, _ b: Int) -> [FeatureMatch]? {
+            refinedMatches[Pair(a, b)] ?? pairMatches[Pair(a, b)]
+        }
+
+        /// Re-match `frame` against every other registered camera using
+        /// epipolar guidance. Cheap enough to run on every registration
+        /// because the epipolar constraint prunes candidates before any
+        /// descriptor comparison.
+        func refineMatches(for frame: Int) {
+            guard let camNew = reconstruction.cameras[frame], let setNew = setsByFrame[frame] else { return }
+            // Sorted: Dictionary order is randomized per process in Swift.
+            for other in reconstruction.cameras.keys.sorted() where other != frame {
+                guard let camOther = reconstruction.cameras[other], let setOther = setsByFrame[other] else { continue }
+                let pair = Pair(frame, other)
+                // Keep the ordering convention: query is the lower frame index.
+                let (qSet, qCam, tSet, tCam) = pair.a == frame
+                    ? (setNew, camNew, setOther, camOther)
+                    : (setOther, camOther, setNew, camNew)
+                let guided = FeatureMatcher.matchGuided(
+                    query: qSet, train: tSet,
+                    queryPose: qCam.pose, trainPose: tCam.pose,
+                    queryIntrinsics: qCam.intrinsics, trainIntrinsics: tCam.intrinsics
+                )
+                // Only adopt guided matches when they beat what we already had;
+                // a bad pose would otherwise poison a good plain match set.
+                if guided.count > (matchesFor(pair.a, pair.b)?.count ?? 0) {
+                    refinedMatches[pair] = guided
+                }
+            }
+        }
+
         // Does `position` land close enough to `keypoint` in `camera`?
         func reprojectsWell(_ position: SIMD3<Double>, _ camera: RegisteredCamera,
-                            _ keypoint: Keypoint, tolerance: Double = 6.0) -> Bool {
+                            _ keypoint: Keypoint, tolerance: Double = 2.5) -> Bool {
             guard let projected = camera.pose.project(position, intrinsics: camera.intrinsics) else { return false }
             let dx = projected.x - Double(keypoint.x), dy = projected.y - Double(keypoint.y)
             return (dx * dx + dy * dy).squareRoot() < tolerance
@@ -260,9 +304,25 @@ public enum StructureFromMotion {
             let registered = reconstruction.cameras.keys.sorted()
             for (i, a) in registered.enumerated() {
                 for b in registered[(i + 1)...] {
-                    guard let matches = pairMatches[Pair(a, b)],
-                          let camA = reconstruction.cameras[a], let camB = reconstruction.cameras[b],
+                    guard let camA = reconstruction.cameras[a], let camB = reconstruction.cameras[b],
                           let kpA = keypointsByFrame[a], let kpB = keypointsByFrame[b] else { continue }
+                    // Guided matches EXTEND existing points; only plain,
+                    // ratio-tested and cross-checked matches may CREATE them.
+                    //
+                    // The epipolar constraint is a line, not a point: a wrong
+                    // feature further along that line satisfies it perfectly.
+                    // Creating a point from such a match is unrecoverable,
+                    // because a point triangulated from two views always
+                    // reprojects well INTO THOSE TWO VIEWS — the reprojection
+                    // check cannot catch its own input. Extending an existing
+                    // point is different: it tests the match against a 3D
+                    // position established independently, which is a real
+                    // check. Measured when guided matches were allowed to
+                    // create points: 3962 points but PnP inlier ratios fell to
+                    // 10/219 and registered cameras dropped from 17 to 9.
+                    let extendMatches = matchesFor(a, b) ?? []
+                    let createMatches = pairMatches[Pair(a, b)] ?? []
+                    let matches = extendMatches
                     // Pair(a,b) keeps a < b, and matches were built with the
                     // lower frame as query, so query indexes a and train b.
                     for match in matches {
@@ -287,7 +347,15 @@ public enum StructureFromMotion {
                             }
                             pointForObservation[obsA] = p
                             extended += 1
-                        } else if pointA == nil && pointB == nil {
+                        }
+                    }
+                    // Creation pass, restricted to plain matches.
+                    for match in createMatches {
+                        let ka = match.queryIndex, kb = match.trainIndex
+                        guard ka < kpA.count, kb < kpB.count else { continue }
+                        let obsA = Observation(frame: a, keypoint: ka)
+                        let obsB = Observation(frame: b, keypoint: kb)
+                        if pointForObservation[obsA] == nil && pointForObservation[obsB] == nil {
                             let nA = camA.intrinsics.normalize(x: Double(kpA[ka].x), y: Double(kpA[ka].y))
                             let nB = camB.intrinsics.normalize(x: Double(kpB[kb].x), y: Double(kpB[kb].y))
                             guard let position = TwoViewGeometry.triangulate(
@@ -328,8 +396,12 @@ public enum StructureFromMotion {
                 guard let keypoints = keypointsByFrame[frame] else { return ([], [], []) }
                 var world: [SIMD3<Double>] = [], image: [SIMD2<Double>] = [], kpIndices: [Int] = []
                 var seen = Set<Int>()
-                for registered in reconstruction.cameras.keys {
-                    guard let matches = pairMatches[Pair(frame, registered)] else { continue }
+                // Sorted, and load-bearing: the `seen` set below makes the
+                // FIRST match for a keypoint win, so iteration order decides which
+                // correspondences PnP receives. Unsorted, the same input produced
+                // 33 registered cameras on one run and 14 on the next.
+                for registered in reconstruction.cameras.keys.sorted() {
+                    guard let matches = matchesFor(frame, registered) else { continue }
                     let frameIsQuery = frame < registered
                     for match in matches {
                         let frameKp = frameIsQuery ? match.queryIndex : match.trainIndex
@@ -377,6 +449,9 @@ public enum StructureFromMotion {
                 //     reprojection), which is what propagates tracks.
                 //   - create: a match where neither side has a point
                 //     triangulates a new one.
+                // Pose is known now, so re-match this camera against the rest
+                // with epipolar guidance before growing structure.
+                refineMatches(for: frame)
                 let (extended, added) = growStructure()
 
                 log?("registered frame \(frame) (\(pnp.inliers.count)/\(c.world.count) PnP inliers, "

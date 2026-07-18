@@ -128,11 +128,36 @@ Implemented:
     | before pyramid | 5/60 | 304 | 1.42 px |
     | with pyramid | **17/60** | **1809** | **1.34 px** |
 
-    Early PnP inlier ratios went to 92/93, 117/118, 133/137. Remaining next
-    steps: guided matching along epipolar lines once a pose is known, and loop
-    closure so the end of an orbit re-links to its start. Registration still
-    fades part-way round (later frames drop to ~28/93 inliers), consistent with
-    accumulating drift plus matching difficulty at the widest viewpoint changes.
+    Early PnP inlier ratios went to 92/93, 117/118, 133/137.
+
+    **Guided epipolar matching** (`FeatureMatcher.matchGuided`) re-matches every
+    pair of already-posed cameras using the epipolar constraint, which lets the
+    ratio test relax because geometry has already eliminated most accidental
+    descriptor collisions. On synthetic frames with deliberately ambiguous
+    descriptors it recovers 86/86 correct matches where plain matching finds 0,
+    and a deliberately wrong pose yields 0 — the constraint does real work.
+    Reconstruction: 17 -> 20/60 cameras, RMSE 1.31 px.
+
+    Two constraints on how it may be used, both learned by measurement:
+    - Guided matches may EXTEND existing points but not CREATE them. The
+      epipolar constraint is a line, not a point, so a wrong feature further
+      along it satisfies the test — and a point triangulated from a bad match
+      always reprojects well into the two views that created it, so the
+      reprojection check cannot catch its own input. Letting guided matches
+      create points gave 3962 points but collapsed PnP inlier ratios to 10/219
+      and dropped registration from 17 to 9 cameras.
+    - The extension reprojection tolerance is tight (2.5 px). At 6 px, wrong
+      observations attach to good points and bias bundle adjustment.
+
+    Loop closure comes free from the same mechanism — the sliding match window
+    never pairs an orbit's end with its start, but guided matching links any two
+    posed cameras that overlap. It has NOT yet been demonstrated closing a real
+    loop, because the orbit does not register all the way round for both ends to
+    exist simultaneously.
+
+    Registration still stops at ~20/60 with late-orbit PnP ratios decaying
+    (14/124), consistent with accumulating drift at the widest viewpoint
+    changes.
 
     Practical note meanwhile: prefer `--target 60` or higher on real captures.
     Denser sampling costs little and matters more than any tuning knob here.

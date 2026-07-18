@@ -60,6 +60,92 @@ public enum FeatureMatcher {
         return distance
     }
 
+    /// Match two frames whose poses are already known, using epipolar geometry
+    /// to constrain the search.
+    ///
+    /// Unguided matching has to be conservative: with a few thousand candidates
+    /// and no geometric context, Lowe's ratio test is the only defence against
+    /// false matches, and it rejects a great many correct ones — precisely the
+    /// ones where a surface has changed appearance, which is exactly what
+    /// happens at the wide viewpoint changes late in an orbit.
+    ///
+    /// Once both cameras are posed, a feature in one image must lie on its
+    /// epipolar line in the other. That single constraint eliminates almost
+    /// every accidental descriptor collision, so the ratio test can be relaxed
+    /// and matches that were previously discarded as ambiguous become usable.
+    /// This is the standard way to densify correspondences after registration.
+    ///
+    /// Only candidates within `epipolarThresholdPixels` of the line are
+    /// considered, which also makes it cheaper than brute force despite being
+    /// more permissive on descriptors.
+    public static func matchGuided(
+        query: FeatureSet, train: FeatureSet,
+        queryPose: CameraPose, trainPose: CameraPose,
+        queryIntrinsics: CameraIntrinsics, trainIntrinsics: CameraIntrinsics,
+        options: MatchOptions = MatchOptions(ratioThreshold: 0.95, crossCheck: false, maxDistance: 100),
+        epipolarThresholdPixels: Double = 4.0
+    ) -> [FeatureMatch] {
+        guard query.count > 0, train.count > 0 else { return [] }
+
+        // Relative pose train <- query, then E = [t]x R in normalized coords.
+        let rQuery = queryPose.rotation, rTrain = trainPose.rotation
+        let rRel = LinearAlgebra.matMul3(rTrain, LinearAlgebra.transpose3(rQuery))
+        let rotatedQueryT = LinearAlgebra.matVec3(rRel, queryPose.translation)
+        let tRel = trainPose.translation - rotatedQueryT
+        let tx: [Double] = [
+            0, -tRel.z, tRel.y,
+            tRel.z, 0, -tRel.x,
+            -tRel.y, tRel.x, 0,
+        ]
+        let e = LinearAlgebra.matMul3(tx, rRel)
+
+        // Pre-normalize the train keypoints once.
+        let trainNormalized = train.keypoints.map {
+            trainIntrinsics.normalize(x: Double($0.x), y: Double($0.y))
+        }
+        // Threshold converted to normalized units via the train focal length.
+        let epipolarThreshold = epipolarThresholdPixels / trainIntrinsics.focalLength
+
+        var matches: [FeatureMatch] = []
+        matches.reserveCapacity(query.count)
+        var claimed = [Bool](repeating: false, count: train.count)
+
+        for q in 0..<query.count {
+            let kp = query.keypoints[q]
+            let a = queryIntrinsics.normalize(x: Double(kp.x), y: Double(kp.y))
+            let line = LinearAlgebra.matVec3(e, SIMD3<Double>(a.x, a.y, 1))
+            let norm = (line.x * line.x + line.y * line.y).squareRoot()
+            guard norm > 1e-12 else { continue }
+
+            let qd = query.descriptor(at: q)
+            var best = Int.max, secondBest = Int.max, bestIndex = -1
+            for t in 0..<train.count where !claimed[t] {
+                let b = trainNormalized[t]
+                let distanceToLine = abs(b.x * line.x + b.y * line.y + line.z) / norm
+                guard distanceToLine < epipolarThreshold else { continue }
+                let distance = hamming(qd, train.descriptor(at: t))
+                if distance < best {
+                    secondBest = best
+                    best = distance
+                    bestIndex = t
+                } else if distance < secondBest {
+                    secondBest = distance
+                }
+            }
+            guard bestIndex >= 0, best <= options.maxDistance else { continue }
+            // The ratio test still runs, but only among candidates that already
+            // satisfy the epipolar constraint — so it is discriminating between
+            // genuinely plausible correspondences rather than the whole image.
+            if secondBest < Int.max {
+                guard Float(best) < options.ratioThreshold * Float(secondBest) else { continue }
+            }
+            // One-to-one: a train feature cannot serve two query features.
+            claimed[bestIndex] = true
+            matches.append(FeatureMatch(queryIndex: q, trainIndex: bestIndex, distance: best))
+        }
+        return matches
+    }
+
     /// Brute-force match `query` against `train`.
     ///
     /// O(n·m) by design. For the frame counts stage 2 hands us (a few hundred
