@@ -61,11 +61,11 @@ public final class CPUFeatureExtractor: FeatureExtractor {
 
     public func extract(index: Int, pixelBuffer: CVPixelBuffer, options: FeatureOptions) throws -> FeatureSet {
         let (luma, width, height) = try LumaBuffer.make(from: pixelBuffer)
-        let response = CPUFeatureExtractor.harrisResponse(luma: luma, width: width, height: height)
-        return FeatureMath.assemble(
-            frameIndex: index, response: response, luma: luma,
-            width: width, height: height, options: options
-        )
+        return FeatureMath.extractPyramid(
+            frameIndex: index, luma: luma, width: width, height: height, options: options
+        ) { levelLuma, levelWidth, levelHeight in
+            CPUFeatureExtractor.harrisResponse(luma: levelLuma, width: levelWidth, height: levelHeight)
+        }
     }
 
     /// Harris corner response over the whole frame.

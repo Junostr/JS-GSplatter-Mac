@@ -15,7 +15,10 @@ import CoreVideo
 // Sharing it makes descriptor parity structural rather than something we have
 // to keep testing into existence.
 
-/// A detected corner. Coordinates are in pixels of the analyzed frame.
+/// A detected corner. Coordinates are always in pixels of the FULL-RESOLUTION
+/// frame, even when the corner was detected on a smaller pyramid level, so
+/// every consumer downstream (matching, triangulation, bundle adjustment) can
+/// stay ignorant of the pyramid.
 public struct Keypoint: Equatable {
     public let x: Float
     public let y: Float
@@ -24,12 +27,20 @@ public struct Keypoint: Equatable {
     /// Dominant orientation in radians, from the intensity centroid. Used to
     /// steer the descriptor so matching survives camera roll.
     public let angle: Float
+    /// Pyramid level this corner was found on (0 = full resolution).
+    public let octave: Int
+    /// Linear size ratio of that level to full resolution (e.g. 2 means the
+    /// corner was found on a half-size image, so its descriptor covers twice
+    /// the area in original pixels).
+    public let scale: Float
 
-    public init(x: Float, y: Float, response: Float, angle: Float) {
+    public init(x: Float, y: Float, response: Float, angle: Float, octave: Int = 0, scale: Float = 1) {
         self.x = x
         self.y = y
         self.response = response
         self.angle = angle
+        self.octave = octave
+        self.scale = scale
     }
 }
 
@@ -112,13 +123,31 @@ public struct FeatureOptions {
     /// enough not to reintroduce the global-threshold problem it exists to fix.
     public var noiseFloorFraction: Float
 
+    /// Number of pyramid levels, each half the linear size of the previous
+    /// (1 = no pyramid, full resolution only).
+    ///
+    /// BRIEF descriptors are computed over a fixed pixel patch, so they are
+    /// not scale invariant: the same physical surface photographed from twice
+    /// the distance produces a completely different bit pattern and simply
+    /// fails to match. Detecting and describing on a pyramid means a feature
+    /// seen small in one frame and large in another can still match, because
+    /// one of the levels puts them at comparable apparent size.
+    ///
+    /// 4 levels covers an 8x scale range, which comfortably spans the distance
+    /// variation in a handheld orbit. Levels use exact 2x2 box downsampling —
+    /// non-integer factors (ORB's 1.2) sample finer but need resampling, and
+    /// the coarse steps are enough for the failure being addressed here.
+    public var pyramidLevels: Int
+
     public init(maxFeatures: Int = 2000, relativeThreshold: Float = 0.01, nmsRadius: Int = 4,
-                spatialBuckets: Int = 8, noiseFloorFraction: Float = 0.0005) {
+                spatialBuckets: Int = 8, noiseFloorFraction: Float = 0.0005,
+                pyramidLevels: Int = 4) {
         self.maxFeatures = maxFeatures
         self.relativeThreshold = relativeThreshold
         self.nmsRadius = nmsRadius
         self.spatialBuckets = spatialBuckets
         self.noiseFloorFraction = noiseFloorFraction
+        self.pyramidLevels = pyramidLevels
     }
 }
 
@@ -382,6 +411,126 @@ public enum FeatureMath {
             let angle = orientation(luma: luma, width: width, height: height, x: candidate.x, y: candidate.y)
             return Keypoint(x: Float(candidate.x), y: Float(candidate.y), response: candidate.value, angle: angle)
         }
+    }
+
+    /// 2x2 box downsample. Exact and separable-free; at these sizes the cost is
+    /// irrelevant next to the Harris pass that consumes the result.
+    public static func downsample(luma: [Float], width: Int, height: Int)
+        -> (luma: [Float], width: Int, height: Int) {
+        let w = width / 2, h = height / 2
+        guard w > 0, h > 0 else { return ([], 0, 0) }
+        var out = [Float](repeating: 0, count: w * h)
+        out.withUnsafeMutableBufferPointer { dst in
+            luma.withUnsafeBufferPointer { src in
+                for y in 0..<h {
+                    let row0 = (y * 2) * width
+                    let row1 = row0 + width
+                    let outRow = y * w
+                    for x in 0..<w {
+                        let x0 = x * 2
+                        dst[outRow + x] = (src[row0 + x0] + src[row0 + x0 + 1]
+                                         + src[row1 + x0] + src[row1 + x0 + 1]) * 0.25
+                    }
+                }
+            }
+        }
+        return (out, w, h)
+    }
+
+    /// Detect and describe across a scale pyramid.
+    ///
+    /// `responseProvider` is the only tier-specific part — it returns the
+    /// Harris response map for a luma buffer at a given size. Everything else
+    /// (level construction, per-level selection, orientation, descriptors,
+    /// coordinate mapping, the global feature budget) is shared, so the tiers
+    /// cannot diverge in any of it.
+    ///
+    /// The feature budget is split across levels by AREA, matching the number
+    /// of distinguishable corners each level can actually support: a level with
+    /// a quarter the pixels gets roughly a quarter the allocation. Without
+    /// that, coarse levels — where responses are stronger because downsampling
+    /// suppresses noise — would crowd out fine detail.
+    public static func extractPyramid(
+        frameIndex: Int, luma: [Float], width: Int, height: Int,
+        options: FeatureOptions,
+        responseProvider: (_ luma: [Float], _ width: Int, _ height: Int) throws -> [Float]
+    ) rethrows -> FeatureSet {
+        let levelCount = max(1, options.pyramidLevels)
+        var levels: [(luma: [Float], width: Int, height: Int)] = [(luma, width, height)]
+        for _ in 1..<levelCount {
+            guard let last = levels.last, last.width >= 64, last.height >= 64 else { break }
+            let next = downsample(luma: last.luma, width: last.width, height: last.height)
+            guard next.width > 0 else { break }
+            levels.append(next)
+        }
+
+        let totalArea = levels.reduce(0.0) { $0 + Double($1.width * $1.height) }
+        var keypoints: [Keypoint] = []
+        var descriptors: [UInt8] = []
+
+        for (octave, level) in levels.enumerated() {
+            let share = totalArea > 0 ? Double(level.width * level.height) / totalArea : 1
+            var levelOptions = options
+            levelOptions.maxFeatures = max(16, Int((Double(options.maxFeatures) * share).rounded()))
+            // NMS radius is in level pixels; keeping it constant would make
+            // coarse levels suppress far more of the original image than fine
+            // ones, so it shrinks with the level (floored at 2).
+            levelOptions.nmsRadius = max(2, options.nmsRadius >> octave)
+
+            let response = try responseProvider(level.luma, level.width, level.height)
+            let levelKeypoints = selectKeypoints(
+                response: response, width: level.width, height: level.height,
+                luma: level.luma, options: levelOptions
+            )
+            let scale = Float(1 << octave)
+            for keypoint in levelKeypoints {
+                // Descriptor is sampled on THIS level, so it covers a patch
+                // `scale` times larger in original pixels — which is exactly
+                // what gives scale invariance.
+                descriptors.append(contentsOf: describe(
+                    luma: level.luma, width: level.width, height: level.height, keypoint: keypoint))
+                // Map back to full-resolution coordinates. The +0.5 centring
+                // accounts for a level pixel covering a `scale`-wide block.
+                keypoints.append(Keypoint(
+                    x: (keypoint.x + 0.5) * scale - 0.5,
+                    y: (keypoint.y + 0.5) * scale - 0.5,
+                    response: keypoint.response, angle: keypoint.angle,
+                    octave: octave, scale: scale
+                ))
+            }
+        }
+        // Levels were appended in order, so the merged list is only sorted
+        // WITHIN each level. Re-sort globally to preserve the strongest-first
+        // contract callers rely on, using the same quantized key and
+        // deterministic tiebreak as single-level selection.
+        //
+        // Cross-level responses are not strictly comparable (downsampling
+        // averages gradients, so coarse levels score lower), which in practice
+        // means fine detail sorts first. That is the right bias: the per-level
+        // budget has already guaranteed each level its share, so this only
+        // decides presentation order, not which features survive.
+        if !keypoints.isEmpty {
+            let maxResponse = keypoints.map { $0.response }.max() ?? 1
+            let sortScale = maxResponse > 0 ? Float(1 << 20) / maxResponse : 1
+            let order = keypoints.indices.sorted { a, b in
+                let ka = (keypoints[a].response * sortScale).rounded()
+                let kb = (keypoints[b].response * sortScale).rounded()
+                if ka != kb { return ka > kb }
+                if keypoints[a].octave != keypoints[b].octave { return keypoints[a].octave < keypoints[b].octave }
+                if keypoints[a].y != keypoints[b].y { return keypoints[a].y < keypoints[b].y }
+                return keypoints[a].x < keypoints[b].x
+            }
+            let bytes = FeatureSet.descriptorBytes
+            var sortedKeypoints = [Keypoint](); sortedKeypoints.reserveCapacity(order.count)
+            var sortedDescriptors = [UInt8](); sortedDescriptors.reserveCapacity(descriptors.count)
+            for index in order {
+                sortedKeypoints.append(keypoints[index])
+                sortedDescriptors.append(contentsOf: descriptors[(index * bytes)..<((index + 1) * bytes)])
+            }
+            keypoints = sortedKeypoints
+            descriptors = sortedDescriptors
+        }
+        return FeatureSet(frameIndex: frameIndex, keypoints: keypoints, descriptors: descriptors)
     }
 
     /// Build the full FeatureSet from a response map. Shared tail of both

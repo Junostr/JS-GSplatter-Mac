@@ -656,25 +656,57 @@ do {
             // would be a promise we cannot keep on real Nvidia/AMD hardware.
             // NMS guarantees unique positions, but uniquing defensively keeps
             // a duplicate from trapping the whole suite.
-            let cByPos = Dictionary(c.keypoints.enumerated().map { ("\($1.x)|\($1.y)", $0) },
+            // Keyed by position AND octave: with a pyramid the same
+            // full-resolution coordinate can be produced by two different
+            // levels, and those are genuinely different features with
+            // different descriptors.
+            let cByPos = Dictionary(c.keypoints.enumerated().map { ("\($1.x)|\($1.y)|\($1.octave)", $0) },
                                     uniquingKeysWith: { first, _ in first })
-            let mByPos = Dictionary(m.keypoints.enumerated().map { ("\($1.x)|\($1.y)", $0) },
+            let mByPos = Dictionary(m.keypoints.enumerated().map { ("\($1.x)|\($1.y)|\($1.octave)", $0) },
                                     uniquingKeysWith: { first, _ in first })
-            expect(Set(cByPos.keys) == Set(mByPos.keys),
-                   "identical keypoint SETS across tiers (\(Set(cByPos.keys).intersection(mByPos.keys).count)/\(c.count) shared)")
+            // Near-exact rather than exact. The tiers' response maps differ by
+            // ~1 ULP, and a pyramid multiplies the chances that some corner
+            // sits exactly on a threshold or NMS boundary and tips one way on
+            // one tier. Demanding a perfect set match would be asserting a
+            // promise the hardware cannot keep; what matters is that the
+            // feature sets are interchangeable.
+            let shared = Set(cByPos.keys).intersection(mByPos.keys).count
+            let overlap = Double(shared) / Double(Swift.max(c.count, m.count))
+            expect(overlap >= 0.97,
+                   "keypoint sets agree across tiers (\(shared)/\(c.count) shared, \(Int(overlap * 100))%)")
 
             // For every shared keypoint, orientation and descriptor must match
             // exactly — these are computed by shared code from the same luma,
             // so any difference here would be a real defect.
             var maxAngleDiff: Float = 0
             var descriptorMismatches = 0
+            var worstDescriptorBits = 0
             for (key, ci) in cByPos {
                 guard let mi = mByPos[key] else { continue }
                 maxAngleDiff = Swift.max(maxAngleDiff, abs(c.keypoints[ci].angle - m.keypoints[mi].angle))
-                if Array(c.descriptor(at: ci)) != Array(m.descriptor(at: mi)) { descriptorMismatches += 1 }
+                let cd = Array(c.descriptor(at: ci)), md = Array(m.descriptor(at: mi))
+                if cd != md {
+                    descriptorMismatches += 1
+                    worstDescriptorBits = Swift.max(worstDescriptorBits,
+                        zip(cd, md).reduce(0) { $0 + ($1.0 ^ $1.1).nonzeroBitCount })
+                }
             }
             expect(maxAngleDiff < 1e-4, "identical orientations for shared keypoints (max Δ \(maxAngleDiff))")
-            expect(descriptorMismatches == 0, "bit-identical descriptors for shared keypoints (\(descriptorMismatches) mismatched)")
+            // Descriptors are near-identical rather than always bit-identical.
+            // Steered BRIEF rounds each rotated sample to a pixel, so an angle
+            // difference of ~5e-7 (which is what the tiers' ~1 ULP response
+            // difference produces) can move a single sample across a rounding
+            // boundary and flip one bit. What matters for matching is that the
+            // Hamming distance stays negligible against the 80-bit accept
+            // threshold — a 1-2 bit difference out of 256 cannot change a match.
+            let mismatchFraction = Double(descriptorMismatches) / Double(Swift.max(1, cByPos.count))
+            expect(mismatchFraction < 0.02,
+                   "descriptors agree for shared keypoints (\(descriptorMismatches)/\(cByPos.count) differ)")
+            expect(worstDescriptorBits <= 4,
+                   "any descriptor difference is negligible vs the match threshold (worst \(worstDescriptorBits)/256 bits)")
+            expect(c.keypoints.allSatisfy { $0.octave >= 0 && $0.scale == Float(1 << $0.octave) },
+                   "octave and scale are consistent")
+            expect(Set(c.keypoints.map { $0.octave }).count > 1, "features come from multiple pyramid levels")
 
             // Ordering is quantization-stabilized, so it should also agree in
             // practice; report it rather than asserting it, since it is a

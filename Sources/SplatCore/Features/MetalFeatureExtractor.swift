@@ -228,15 +228,67 @@ public final class MetalFeatureExtractor: FeatureExtractor {
         }
 
         let count = width * height
-        let responsePtr = responseBuffer.contents().bindMemory(to: Float.self, capacity: count)
-        let response = Array(UnsafeBufferPointer(start: responsePtr, count: count))
         let lumaPtr = lumaBuffer.contents().bindMemory(to: Float.self, capacity: count)
         let luma = Array(UnsafeBufferPointer(start: lumaPtr, count: count))
 
-        return FeatureMath.assemble(
-            frameIndex: index, response: response, luma: luma,
-            width: width, height: height, options: options
-        )
+        // Level 0's response is already computed above; deeper levels re-enter
+        // through harrisResponse(luma:) with their own downsampled buffers.
+        let responsePtr = responseBuffer.contents().bindMemory(to: Float.self, capacity: count)
+        let level0Response = Array(UnsafeBufferPointer(start: responsePtr, count: count))
+
+        return try FeatureMath.extractPyramid(
+            frameIndex: index, luma: luma, width: width, height: height, options: options
+        ) { levelLuma, levelWidth, levelHeight in
+            if levelWidth == width && levelHeight == height { return level0Response }
+            return try self.harrisResponse(luma: levelLuma, width: levelWidth, height: levelHeight)
+        }
+    }
+
+    /// Harris response for an arbitrary luma buffer — the pyramid entry point.
+    /// Uploads the level's luma and runs the same sobel + harris kernels used
+    /// for level 0, so every level goes through identical arithmetic.
+    func harrisResponse(luma: [Float], width: Int, height: Int) throws -> [Float] {
+        try ensureScratch(width: width, height: height)
+        guard let lumaBuffer = lumaBuffer, let ixxBuffer = ixxBuffer, let iyyBuffer = iyyBuffer,
+              let ixyBuffer = ixyBuffer, let responseBuffer = responseBuffer else {
+            throw FeatureError.kernelFailure("scratch allocation failed")
+        }
+        let count = width * height
+        luma.withUnsafeBytes { raw in
+            lumaBuffer.contents().copyMemory(from: raw.baseAddress!, byteCount: count * MemoryLayout<Float>.size)
+        }
+
+        guard let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw FeatureError.kernelFailure("cannot create command buffer")
+        }
+        var size = SIMD2<UInt32>(UInt32(width), UInt32(height))
+        let tg = MTLSize(width: 16, height: 16, depth: 1)
+        let grid = MTLSize(width: (width + 15) / 16, height: (height + 15) / 16, depth: 1)
+
+        encoder.setComputePipelineState(sobelPipeline)
+        encoder.setBuffer(lumaBuffer, offset: 0, index: 0)
+        encoder.setBytes(&size, length: MemoryLayout<SIMD2<UInt32>>.size, index: 1)
+        encoder.setBuffer(ixxBuffer, offset: 0, index: 2)
+        encoder.setBuffer(iyyBuffer, offset: 0, index: 3)
+        encoder.setBuffer(ixyBuffer, offset: 0, index: 4)
+        encoder.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+
+        encoder.setComputePipelineState(harrisPipeline)
+        encoder.setBuffer(ixxBuffer, offset: 0, index: 0)
+        encoder.setBuffer(iyyBuffer, offset: 0, index: 1)
+        encoder.setBuffer(ixyBuffer, offset: 0, index: 2)
+        encoder.setBytes(&size, length: MemoryLayout<SIMD2<UInt32>>.size, index: 3)
+        encoder.setBuffer(responseBuffer, offset: 0, index: 4)
+        encoder.dispatchThreadgroups(grid, threadsPerThreadgroup: tg)
+
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error { throw FeatureError.kernelFailure(error.localizedDescription) }
+
+        let ptr = responseBuffer.contents().bindMemory(to: Float.self, capacity: count)
+        return Array(UnsafeBufferPointer(start: ptr, count: count))
     }
 
     private func ensureScratch(width: Int, height: Int) throws {

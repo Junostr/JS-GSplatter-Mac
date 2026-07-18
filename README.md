@@ -118,14 +118,21 @@ Implemented:
     PnP inlier counts going from 10/19 to 104/214, but it does not yet complete
     a full orbit.
 
-    The remaining bottleneck looks like DESCRIPTOR MATCHING across viewpoint
-    change, not the SfM logic: sampling 60 frames instead of 20 (smaller gaps
-    between neighbours) more than doubled the registered cameras on its own.
-    BRIEF is not scale- or strongly rotation-invariant, so matching degrades
-    over the ~0.7 s of handheld orbital motion between sparsely sampled frames.
-    Likely next steps, in order: a scale pyramid for the detector/descriptor,
-    guided matching along epipolar lines once a pose is known, and loop closure
-    so the end of an orbit re-links to its start.
+    A 4-level scale pyramid (`FeatureOptions.pyramidLevels`) confirmed that
+    diagnosis and produced the single largest improvement so far — features are
+    now detected and described per level, so a surface seen at different
+    apparent sizes still matches:
+
+    | | cameras | points | RMSE |
+    |---|---|---|---|
+    | before pyramid | 5/60 | 304 | 1.42 px |
+    | with pyramid | **17/60** | **1809** | **1.34 px** |
+
+    Early PnP inlier ratios went to 92/93, 117/118, 133/137. Remaining next
+    steps: guided matching along epipolar lines once a pose is known, and loop
+    closure so the end of an orbit re-links to its start. Registration still
+    fades part-way round (later frames drop to ~28/93 inliers), consistent with
+    accumulating drift plus matching difficulty at the widest viewpoint changes.
 
     Practical note meanwhile: prefer `--target 60` or higher on real captures.
     Denser sampling costs little and matters more than any tuning knob here.
