@@ -203,10 +203,38 @@ Implemented:
       seed well; with them included the seed search reported "no pair had
       enough parallax" and failed outright.
 
-    Also unresolved and probably prior to loop closure: focal estimation is
-    frame-set sensitive — the same capture estimated 0.58x, 0.75x and 0.90x of
-    the long side at different `--target` values, and a bad focal degrades
-    everything downstream.
+    Also unresolved and probably prior to loop closure: **focal estimation is
+    frame-set sensitive** — the same capture estimates 0.50x, 0.58x, 0.75x,
+    0.85x and 0.90x of the long side at different `--target` values, against a
+    true value near 0.72x for an iPhone at 4K. A bad focal degrades everything
+    downstream, so this likely has to be fixed before loop closure (or any
+    other change) can be judged fairly.
+
+    An attempt was made and REVERTED; the findings are worth keeping:
+
+    - The root flaw is real and identified. The current scorer re-fits the
+      essential matrix for each candidate focal, so the RANSAC inlier set moves
+      with the focal — "which focal is right?" is confounded with "which points
+      are inliers?". Scoring by triangulated point count compounds it, because a
+      wrong focal still admits a self-consistent model with plenty of surviving
+      points, so the count has no sharp peak at the truth.
+    - The principled fix is Hartley's: fit the FUNDAMENTAL matrix once from
+      pixel coordinates (calibration-independent), then sweep K and minimise the
+      singular-value asymmetry (s0 − s1) / (s0 + s1) of E = KᵀFK, since a valid
+      essential matrix has singular values (s, s, 0).
+    - Implemented, and it did make the estimate **consistent** — 0.50x at every
+      `--target`. But 0.50x is the bottom of the sweep range, i.e. the score
+      decreases monotonically toward small focals instead of having an interior
+      minimum at the truth. Consistently wrong is more dangerous than noisily
+      right, so it was reverted rather than shipped.
+    - Next step for whoever picks this up: work out why the asymmetry has no
+      interior minimum before wiring it in again. Worth checking the principal
+      point's role in K (the sweep holds cx, cy at the image centre), whether
+      the asymmetry should be evaluated on a normalised F, and validating the
+      whole scorer against a SYNTHETIC pair with known focal — where the correct
+      answer is known — before trusting it on real footage. That synthetic test
+      is the piece this attempt skipped, and it would have caught the problem in
+      minutes rather than after a full real-capture sweep.
 
     **Resolved (was: 25/60 vs 29/60 from an identical binary).** Root cause was
     the registration queue: `remaining.sorted { support > support }` sorted a
