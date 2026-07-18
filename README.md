@@ -4,7 +4,7 @@ Native macOS app that converts a photo series or video into a 3D Gaussian
 Splat. Universal binary (arm64 + x86_64), deployment target **macOS 11.0
 (Big Sur)**, GPU compute via raw Metal — no CUDA anywhere.
 
-## Status: stages 1 (ingestion), 2 (filtering), 3 (features, partial), 4 (probe)
+## Status: stages 1 (ingestion), 2 (filtering), 3 (SfM), 4 (probe)
 
 Implemented:
 - **Ingestion** (`SplatCore/Ingestion/`) — photo folders (ImageIO: EXIF
@@ -73,9 +73,34 @@ Implemented:
   and drives the selected engine stub. `--force-baseline` overrides enhanced
   tier for testing; `--json` emits the full report machine-readably.
 
-Not yet implemented: the rest of stage 3 (geometric verification, incremental
-pose estimation, triangulation, bundle adjustment), real training kernels (stage 5),
-viewer (stage 6), export (stage 7).
+- **Structure from motion** (`SplatCore/Geometry/`) — completes stage 3.
+  Self-contained linear algebra (Jacobi eigensolver, 3x3 SVD, Cholesky —
+  deliberately not LAPACK, whose Accelerate interface changed across exactly
+  the SDK range this project straddles), a pinhole camera model, two-view
+  geometry (normalized 8-point essential matrix under RANSAC with Sampson
+  distance, pose recovery by cheirality, DLT triangulation), PnP registration
+  for additional views, and sparse Levenberg-Marquardt bundle adjustment using
+  the Schur complement. `StructureFromMotion.reconstruct` drives the whole
+  thing; `splatctl sfm <input> [--target N] [--ply out.ply]` runs it end to end
+  and can dump the sparse cloud plus camera path as PLY.
+
+  Verified against synthetic scenes with exactly known ground truth (real
+  imagery cannot test this layer — without ground truth you can only check
+  that a reconstruction is self-consistent, which a mirrored one also is):
+  rotation recovered to 0.0 deg, structure matching truth to 8e-7 relative,
+  robust to 25% outliers, 6/6 cameras registered end to end at 1.3e-5 px RMSE,
+  and bit-identical across runs.
+
+  **Known limitation:** two-view initialization degenerates on plane-dominant
+  scenes, where the 8-point algorithm cannot determine E uniquely — RANSAC
+  reports a large inlier set but the pose is wrong and points fail cheirality
+  (measured: 99 inliers, 4 triangulated). The fix is homography/essential
+  model selection as in ORB-SLAM. Captures orbiting a real object with depth
+  variation are unaffected, but this needs doing before real-world captures
+  are reliable.
+
+Not yet implemented: real training kernels (stage 5), viewer (stage 6),
+export (stage 7), and homography-based initialization for planar scenes.
 
 ## Tier architecture
 
@@ -99,7 +124,7 @@ Three build paths, each with a distinct purpose:
 **1. Everyday development — SPM (CLT is enough for arm64):**
 ```sh
 swift run splatctl [probe|ingest|filter] ...
-swift run selftest        # test suite (98 assertions, synthesizes its own fixtures)
+swift run selftest        # test suite (161 assertions, synthesizes its own fixtures)
 ```
 Note: on macOS 27 tooling these local builds get a 12.0 deployment floor
 (see below) — fine for development, not for release. The arm64 slice builds

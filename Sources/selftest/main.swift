@@ -738,5 +738,475 @@ do {
     expect(FeatureMatcher.hamming(a[0...1], a[0...1]) == 0, "hamming of a value with itself is 0")
 }
 
+// MARK: - Stage 3: two-view geometry
+//
+// Synthetic scenes with exactly known poses. Real imagery cannot test this
+// layer: without ground truth you can only check that a reconstruction is
+// self-consistent, which a mirrored or wrongly-scaled one also is.
+
+func rotationAboutY(_ degrees: Double) -> [Double] {
+    let t = degrees * .pi / 180
+    return [cos(t), 0, sin(t), 0, 1, 0, -sin(t), 0, cos(t)]
+}
+
+func rotationAngleBetween(_ a: [Double], _ b: [Double]) -> Double {
+    // Geodesic angle on SO(3): acos((trace(A Bᵀ) − 1) / 2)
+    let abt = LinearAlgebra.matMul3(a, LinearAlgebra.transpose3(b))
+    let trace = abt[0] + abt[4] + abt[8]
+    return acos(Swift.max(-1, Swift.min(1, (trace - 1) / 2))) * 180 / .pi
+}
+
+/// Deterministic synthetic scene: 3D points, two cameras, exact projections.
+func makeSyntheticPair(
+    pointCount: Int, rotationDegrees: Double, baseline: SIMD3<Double>,
+    intrinsics: CameraIntrinsics, seed: UInt64
+) -> (points: [SIMD3<Double>], pose2: CameraPose, kp1: [Keypoint], kp2: [Keypoint], matches: [FeatureMatch]) {
+    var rng = SplitMix64(seed: seed)
+    let rotation = rotationAboutY(rotationDegrees)
+    // Pose is world->camera, so t = -R * C for camera centre C.
+    let rc = LinearAlgebra.matVec3(rotation, baseline)
+    let pose2 = CameraPose(rotation: rotation, translation: SIMD3<Double>(-rc.x, -rc.y, -rc.z))
+    let pose1 = CameraPose.identity
+
+    var points: [SIMD3<Double>] = []
+    var kp1: [Keypoint] = []
+    var kp2: [Keypoint] = []
+    var matches: [FeatureMatch] = []
+
+    while points.count < pointCount {
+        // Spread in a slab in front of both cameras; varied depth gives the
+        // parallax the essential matrix needs.
+        let x = (Double(rng.nextUniform()) - 0.5) * 4.0
+        let y = (Double(rng.nextUniform()) - 0.5) * 3.0
+        let z = 3.0 + Double(rng.nextUniform()) * 4.0
+        let p = SIMD3<Double>(x, y, z)
+        guard let a = pose1.project(p, intrinsics: intrinsics),
+              let b = pose2.project(p, intrinsics: intrinsics) else { continue }
+        // Keep only points that land inside a plausible image.
+        guard a.x > 0, a.x < 2 * intrinsics.cx, a.y > 0, a.y < 2 * intrinsics.cy,
+              b.x > 0, b.x < 2 * intrinsics.cx, b.y > 0, b.y < 2 * intrinsics.cy else { continue }
+        let index = points.count
+        points.append(p)
+        kp1.append(Keypoint(x: Float(a.x), y: Float(a.y), response: 1, angle: 0))
+        kp2.append(Keypoint(x: Float(b.x), y: Float(b.y), response: 1, angle: 0))
+        matches.append(FeatureMatch(queryIndex: index, trainIndex: index, distance: 0))
+    }
+    return (points, pose2, kp1, kp2, matches)
+}
+
+print("Linear algebra:")
+do {
+    // Symmetric eigen against a known decomposition.
+    let m: [Double] = [2, 1, 0, 1, 2, 0, 0, 0, 3]
+    let (values, _) = LinearAlgebra.symmetricEigen(m, n: 3)
+    // Eigenvalues of [[2,1],[1,2]] are 1 and 3; plus the isolated 3.
+    expect(abs(values[0] - 1) < 1e-9, "smallest eigenvalue is 1 (got \(values[0]))")
+    expect(abs(values[1] - 3) < 1e-9 && abs(values[2] - 3) < 1e-9, "remaining eigenvalues are 3")
+
+    // SVD on a GENERAL matrix. A diagonal fixture is near-useless here: it
+    // has U = V = I, so a transpose or sign error reconstructs perfectly and
+    // the test passes while the decomposition is wrong.
+    func checkSVD(_ a: [Double], _ label: String, expectRankDeficient: Bool) {
+        let (u, s, vt) = LinearAlgebra.svd3x3(a)
+        let sMat: [Double] = [s[0], 0, 0, 0, s[1], 0, 0, 0, s[2]]
+        let recon = LinearAlgebra.matMul3(u, LinearAlgebra.matMul3(sMat, vt))
+        let maxErr = zip(recon, a).map { abs($0 - $1) }.max() ?? 1
+        expect(maxErr < 1e-9, "\(label): U·S·Vᵀ reconstructs A (max err \(maxErr))")
+        expect(s[0] >= s[1] && s[1] >= s[2], "\(label): singular values descend")
+
+        // U must be a genuine orthonormal basis. This is the property that
+        // actually broke: for a rank-deficient A the third column collapsed
+        // to the zero vector, so |col| == 0 and every downstream use of U
+        // silently produced garbage.
+        for col in 0..<3 {
+            let v = SIMD3<Double>(u[col], u[3 + col], u[6 + col])
+            expect(abs(LinearAlgebra.length(v) - 1) < 1e-9,
+                   "\(label): U column \(col) is unit length (got \(LinearAlgebra.length(v)))")
+        }
+        let uut = LinearAlgebra.matMul3(u, LinearAlgebra.transpose3(u))
+        let offDiag = [uut[1], uut[2], uut[5]].map { abs($0) }.max() ?? 1
+        expect(offDiag < 1e-9, "\(label): U is orthogonal (max off-diagonal \(offDiag))")
+        expect(abs(abs(LinearAlgebra.determinant3(u)) - 1) < 1e-9,
+               "\(label): |det(U)| == 1 (got \(LinearAlgebra.determinant3(u)))")
+        if expectRankDeficient {
+            expect(s[2] == 0, "\(label): a numerically-zero singular value is reported as exactly 0 (got \(s[2]))")
+        }
+    }
+    checkSVD([1, 2, 3, 4, 5, 6, 7, 8, 10], "general", expectRankDeficient: false)
+    checkSVD([3, 0, 0, 0, 2, 0, 0, 0, 0], "diagonal rank-2", expectRankDeficient: true)
+    // The real regression case: an essential matrix, [t]× R, exactly rank 2.
+    // Its zero singular value arrives as sqrt(~1e-18) ≈ 1e-9, which an
+    // absolute 1e-12 tolerance fails to recognize.
+    let rGT = rotationAboutY(8)
+    let tHat = SIMD3<Double>(0.9965, 0.0830, 0)
+    let tCross: [Double] = [0, -tHat.z, tHat.y, tHat.z, 0, -tHat.x, -tHat.y, tHat.x, 0]
+    checkSVD(LinearAlgebra.matMul3(tCross, rGT), "essential matrix", expectRankDeficient: true)
+
+    // nearestRotation on a scaled rotation must return the rotation.
+    let r = rotationAboutY(30)
+    let scaled = r.map { $0 * 2.5 }
+    let recovered = LinearAlgebra.nearestRotation(scaled)
+    expect(rotationAngleBetween(recovered, r) < 1e-6, "nearestRotation strips scale")
+    expect(abs(LinearAlgebra.determinant3(recovered) - 1) < 1e-9, "nearestRotation has det +1")
+
+    // SPD solve.
+    let spd: [Double] = [4, 1, 1, 3]
+    let rhs: [Double] = [1, 2]
+    if let x = LinearAlgebra.solveSPD(spd, rhs, n: 2) {
+        let r0 = spd[0] * x[0] + spd[1] * x[1]
+        let r1 = spd[2] * x[0] + spd[3] * x[1]
+        expect(abs(r0 - 1) < 1e-12 && abs(r1 - 2) < 1e-12, "solveSPD solves the system")
+    } else {
+        expect(false, "solveSPD returned nil on an SPD matrix")
+    }
+    expect(LinearAlgebra.solveSPD([1, 0, 0, -1], [1, 1], n: 2) == nil, "solveSPD rejects non-PD input")
+}
+
+print("Camera model:")
+do {
+    let intrinsics = CameraIntrinsics.guess(width: 1920, height: 1080)
+    expect(abs(intrinsics.cx - 960) < 1e-9 && abs(intrinsics.cy - 540) < 1e-9, "principal point centres the image")
+    let round = intrinsics.project(intrinsics.normalize(x: 123, y: 456))
+    expect(abs(round.x - 123) < 1e-9 && abs(round.y - 456) < 1e-9, "normalize/project round-trip")
+
+    // A point behind the camera must not project.
+    let pose = CameraPose.identity
+    expect(pose.project(SIMD3<Double>(0, 0, -5), intrinsics: intrinsics) == nil,
+           "points behind the camera do not project")
+
+    // Camera centre of a translated pose.
+    let c = SIMD3<Double>(1, 2, 3)
+    let r = rotationAboutY(25)
+    let rc = LinearAlgebra.matVec3(r, c)
+    let posed = CameraPose(rotation: r, translation: SIMD3<Double>(-rc.x, -rc.y, -rc.z))
+    let centre = posed.center
+    expect(abs(centre.x - 1) < 1e-9 && abs(centre.y - 2) < 1e-9 && abs(centre.z - 3) < 1e-9,
+           "camera centre recovers -Rᵀt (got \(centre))")
+}
+
+print("Two-view geometry (exact synthetic data):")
+do {
+    let intrinsics = CameraIntrinsics(focalLength: 1200, cx: 960, cy: 540)
+    let baseline = SIMD3<Double>(0.6, 0.05, 0)
+    let scene = makeSyntheticPair(pointCount: 120, rotationDegrees: 8,
+                                  baseline: baseline, intrinsics: intrinsics, seed: 42)
+
+    guard let result = TwoViewGeometry.estimate(
+        matches: scene.matches, keypoints1: scene.kp1, keypoints2: scene.kp2,
+        intrinsics1: intrinsics, intrinsics2: intrinsics
+    ) else {
+        expect(false, "two-view estimation returned a result")
+        exit(1)
+    }
+
+    let rotationError = rotationAngleBetween(result.pose.rotation, scene.pose2.rotation)
+    print(String(format: "      rotation error %.4f deg, inliers %d/%d, points %d",
+                 rotationError, result.inliers.count, scene.matches.count, result.points.count))
+    expect(rotationError < 0.5, "recovered rotation matches ground truth (\(rotationError) deg)")
+
+    // Translation is recovered only up to scale, so compare directions.
+    let tTrue = scene.pose2.translation
+    let tTrueNorm = LinearAlgebra.length(tTrue)
+    let tEst = result.pose.translation
+    let dot = (tTrue.x * tEst.x + tTrue.y * tEst.y + tTrue.z * tEst.z) / tTrueNorm
+    let directionError = acos(Swift.max(-1, Swift.min(1, abs(dot)))) * 180 / .pi
+    expect(directionError < 1.0, "recovered translation direction matches (\(directionError) deg)")
+
+    expect(result.inliers.count >= scene.matches.count - 2,
+           "essentially all exact correspondences are inliers (\(result.inliers.count)/\(scene.matches.count))")
+    expect(result.points.count > 100, "triangulation produced points (\(result.points.count))")
+
+    // Triangulated structure must match ground truth up to a single global
+    // scale (two views cannot fix scale).
+    var ratios: [Double] = []
+    for (i, matchIndex) in result.pointMatchIndices.enumerated() {
+        let truth = scene.points[scene.matches[matchIndex].queryIndex]
+        ratios.append(LinearAlgebra.length(truth) / Swift.max(1e-12, LinearAlgebra.length(result.points[i])))
+    }
+    let meanRatio = ratios.reduce(0, +) / Double(ratios.count)
+    let maxDeviation = ratios.map { abs($0 / meanRatio - 1) }.max() ?? 1
+    expect(maxDeviation < 0.02, "triangulated structure matches truth up to one global scale (max dev \(maxDeviation))")
+}
+
+print("Two-view geometry (noise and outliers):")
+do {
+    let intrinsics = CameraIntrinsics(focalLength: 1200, cx: 960, cy: 540)
+    var scene = makeSyntheticPair(pointCount: 140, rotationDegrees: 6,
+                                  baseline: SIMD3<Double>(0.5, 0, 0.05), intrinsics: intrinsics, seed: 7)
+
+    // Corrupt 25% of the matches into random wrong correspondences —
+    // RANSAC's whole purpose.
+    var rng = SplitMix64(seed: 99)
+    let outlierCount = scene.matches.count / 4
+    for i in 0..<outlierCount {
+        let victim = Int(rng.next() % UInt64(scene.matches.count))
+        let wrongTarget = Int(rng.next() % UInt64(scene.kp2.count))
+        scene.matches[victim] = FeatureMatch(queryIndex: scene.matches[victim].queryIndex,
+                                             trainIndex: wrongTarget, distance: 50)
+        _ = i
+    }
+
+    guard let result = TwoViewGeometry.estimate(
+        matches: scene.matches, keypoints1: scene.kp1, keypoints2: scene.kp2,
+        intrinsics1: intrinsics, intrinsics2: intrinsics
+    ) else {
+        expect(false, "estimation survived 25% outliers")
+        exit(1)
+    }
+    let rotationError = rotationAngleBetween(result.pose.rotation, scene.pose2.rotation)
+    print(String(format: "      with 25%% outliers: rotation error %.4f deg, inliers %d/%d",
+                 rotationError, result.inliers.count, scene.matches.count))
+    expect(rotationError < 1.0, "rotation still recovered under 25% outliers (\(rotationError) deg)")
+    expect(result.inliers.count > scene.matches.count / 2, "RANSAC kept the consensus set")
+}
+
+print("Two-view degenerate inputs:")
+do {
+    let intrinsics = CameraIntrinsics.guess(width: 640, height: 480)
+    expect(TwoViewGeometry.estimate(matches: [], keypoints1: [], keypoints2: [],
+                                    intrinsics1: intrinsics, intrinsics2: intrinsics) == nil,
+           "no matches yields no result")
+    let few = (0..<4).map { FeatureMatch(queryIndex: $0, trainIndex: $0, distance: 0) }
+    let kps = (0..<4).map { Keypoint(x: Float($0 * 10), y: Float($0 * 10), response: 1, angle: 0) }
+    expect(TwoViewGeometry.estimate(matches: few, keypoints1: kps, keypoints2: kps,
+                                    intrinsics1: intrinsics, intrinsics2: intrinsics) == nil,
+           "fewer than 8 matches yields no result")
+}
+
+print("Bundle adjustment:")
+do {
+    let intrinsics = CameraIntrinsics(focalLength: 1200, cx: 960, cy: 540)
+    let baseline = SIMD3<Double>(0.6, 0.05, 0)
+    let scene = makeSyntheticPair(pointCount: 100, rotationDegrees: 8,
+                                  baseline: baseline, intrinsics: intrinsics, seed: 2024)
+
+    // Ground-truth reconstruction: reprojection error must be ~0. This is
+    // first a check on the whole camera/projection convention stack — if the
+    // conventions disagree anywhere, exact inputs would not give exact output.
+    var keypointsByFrame: [Int: [Keypoint]] = [0: scene.kp1, 1: scene.kp2]
+    func makeReconstruction(pose2: CameraPose, points: [SIMD3<Double>]) -> Reconstruction {
+        var r = Reconstruction()
+        r.cameras[0] = RegisteredCamera(frameIndex: 0, pose: .identity, intrinsics: intrinsics)
+        r.cameras[1] = RegisteredCamera(frameIndex: 1, pose: pose2, intrinsics: intrinsics)
+        r.points = points.enumerated().map {
+            ScenePoint(position: $1, observations: [(frame: 0, keypoint: $0), (frame: 1, keypoint: $0)])
+        }
+        return r
+    }
+
+    let truth = makeReconstruction(pose2: scene.pose2, points: scene.points)
+    let truthRMSE = truth.reprojectionRMSE(keypoints: keypointsByFrame)
+    expect(truthRMSE < 1e-3, "ground-truth reconstruction reprojects exactly (RMSE \(truthRMSE) px; Keypoint stores Float, so ~1e-5 is the floor)")
+
+    // Now perturb points and the second camera's rotation, and let BA recover.
+    var rng = SplitMix64(seed: 555)
+    let perturbedPoints = scene.points.map { p in
+        SIMD3<Double>(p.x + (Double(rng.nextUniform()) - 0.5) * 0.30,
+                      p.y + (Double(rng.nextUniform()) - 0.5) * 0.30,
+                      p.z + (Double(rng.nextUniform()) - 0.5) * 0.30)
+    }
+    let perturbedPose2 = scene.pose2.rotated(byAxisAngle: SIMD3<Double>(0.010, -0.015, 0.008))
+    var reconstruction = makeReconstruction(pose2: perturbedPose2, points: perturbedPoints)
+
+    let before = reconstruction.reprojectionRMSE(keypoints: keypointsByFrame)
+    let rotationErrorBefore = rotationAngleBetween(reconstruction.cameras[1]!.pose.rotation, scene.pose2.rotation)
+    let result = BundleAdjustment.refine(reconstruction: &reconstruction, keypoints: keypointsByFrame)
+    let after = reconstruction.reprojectionRMSE(keypoints: keypointsByFrame)
+    let rotationErrorAfter = rotationAngleBetween(reconstruction.cameras[1]!.pose.rotation, scene.pose2.rotation)
+
+    print(String(format: "      RMSE %.4f -> %.4f px in %d iters (rotation err %.4f -> %.4f deg)",
+                 before, after, result.iterations, rotationErrorBefore, rotationErrorAfter))
+    expect(after < before, "bundle adjustment reduces reprojection error")
+    expect(after < 0.05, "converges to sub-0.05px reprojection error (got \(after))")
+    expect(rotationErrorAfter < rotationErrorBefore, "camera rotation moves toward truth")
+    expect(rotationErrorAfter < 0.05, "recovers the true rotation (\(rotationErrorAfter) deg)")
+    expect(result.initialRMSE >= result.finalRMSE, "reported RMSE is non-increasing")
+
+    // The first camera is the gauge anchor and must not move at all.
+    let anchor = reconstruction.cameras[0]!.pose
+    expect(anchor.rotation == CameraPose.identity.rotation && anchor.translation == .zero,
+           "the fixed first camera is untouched")
+
+    // Baseline length is the free scale DOF and must be preserved.
+    let baselineAfter = LinearAlgebra.length(reconstruction.cameras[1]!.pose.translation)
+    let baselineBefore = LinearAlgebra.length(perturbedPose2.translation)
+    expect(abs(baselineAfter - baselineBefore) / baselineBefore < 0.02,
+           "scale gauge holds the baseline length (\(baselineBefore) -> \(baselineAfter))")
+
+    // Degenerate input must not crash or report nonsense.
+    var empty = Reconstruction()
+    let emptyResult = BundleAdjustment.refine(reconstruction: &empty, keypoints: [:])
+    expect(emptyResult.iterations == 0, "empty reconstruction is a no-op")
+}
+
+print("Absolute pose (PnP):")
+do {
+    let intrinsics = CameraIntrinsics(focalLength: 1100, cx: 800, cy: 600)
+    // A known camera looking at a known 3D cloud.
+    let rotation = rotationAboutY(20)
+    let centre = SIMD3<Double>(1.2, -0.4, -0.5)
+    let rc = LinearAlgebra.matVec3(rotation, centre)
+    let truePose = CameraPose(rotation: rotation, translation: SIMD3<Double>(-rc.x, -rc.y, -rc.z))
+
+    var rng = SplitMix64(seed: 31337)
+    var worldPoints: [SIMD3<Double>] = []
+    var imagePoints: [SIMD2<Double>] = []
+    while worldPoints.count < 60 {
+        let p = SIMD3<Double>((Double(rng.nextUniform()) - 0.5) * 5,
+                              (Double(rng.nextUniform()) - 0.5) * 4,
+                              3.0 + Double(rng.nextUniform()) * 5)
+        guard let projected = truePose.project(p, intrinsics: intrinsics) else { continue }
+        worldPoints.append(p)
+        imagePoints.append(projected)
+    }
+
+    guard let clean = PoseEstimation.estimatePose(worldPoints: worldPoints, imagePoints: imagePoints,
+                                                  intrinsics: intrinsics) else {
+        expect(false, "PnP returned a pose")
+        exit(1)
+    }
+    let rotationError = rotationAngleBetween(clean.pose.rotation, truePose.rotation)
+    let centreError = LinearAlgebra.length(clean.pose.center - truePose.center)
+    print(String(format: "      clean: rotation err %.5f deg, centre err %.5f, inliers %d/%d",
+                 rotationError, centreError, clean.inliers.count, worldPoints.count))
+    expect(rotationError < 0.01, "PnP recovers rotation (\(rotationError) deg)")
+    expect(centreError < 0.01, "PnP recovers camera centre (\(centreError))")
+    expect(clean.inliers.count >= worldPoints.count - 2, "clean data is almost entirely inliers")
+
+    // 30% of the 2D observations corrupted.
+    var corrupted = imagePoints
+    for i in 0..<(worldPoints.count * 3 / 10) {
+        let victim = Int(rng.next() % UInt64(corrupted.count))
+        corrupted[victim] = SIMD2<Double>(Double(rng.nextUniform()) * 1600,
+                                          Double(rng.nextUniform()) * 1200)
+        _ = i
+    }
+    guard let robust = PoseEstimation.estimatePose(worldPoints: worldPoints, imagePoints: corrupted,
+                                                   intrinsics: intrinsics) else {
+        expect(false, "PnP survived 30% outliers")
+        exit(1)
+    }
+    let robustRotationError = rotationAngleBetween(robust.pose.rotation, truePose.rotation)
+    print(String(format: "      30%% outliers: rotation err %.5f deg, inliers %d/%d",
+                 robustRotationError, robust.inliers.count, worldPoints.count))
+    expect(robustRotationError < 0.5, "PnP still recovers rotation under 30% outliers (\(robustRotationError) deg)")
+
+    expect(PoseEstimation.estimatePose(worldPoints: Array(worldPoints.prefix(3)),
+                                       imagePoints: Array(imagePoints.prefix(3)),
+                                       intrinsics: intrinsics) == nil,
+           "fewer than 6 correspondences yields no pose")
+}
+
+print("Incremental structure from motion (end-to-end, synthetic):")
+do {
+    // A camera arc around a 3D cloud, with synthetic descriptors that make
+    // matching unambiguous. This exercises the real pipeline — matching,
+    // track building, initial pair selection, PnP registration, triangulation
+    // and bundle adjustment — against poses we know exactly.
+    let intrinsics = CameraIntrinsics(focalLength: 1000, cx: 640, cy: 360)
+    let frameCount = 6
+    var rng = SplitMix64(seed: 8080)
+
+    var world: [SIMD3<Double>] = []
+    while world.count < 220 {
+        world.append(SIMD3<Double>((Double(rng.nextUniform()) - 0.5) * 4,
+                                   (Double(rng.nextUniform()) - 0.5) * 3,
+                                   4.0 + Double(rng.nextUniform()) * 3))
+    }
+
+    // Cameras translate sideways with a slight inward rotation.
+    var truePoses: [CameraPose] = []
+    for i in 0..<frameCount {
+        let t = Double(i)
+        let rotation = rotationAboutY(-3.0 * t)
+        let centre = SIMD3<Double>(0.35 * t, 0.02 * t, 0)
+        let rc = LinearAlgebra.matVec3(rotation, centre)
+        truePoses.append(CameraPose(rotation: rotation, translation: SIMD3<Double>(-rc.x, -rc.y, -rc.z)))
+    }
+
+    // Each world point gets a unique descriptor, reused across every frame it
+    // appears in — a stand-in for a perfect detector, isolating the geometry.
+    var descriptorFor: [[UInt8]] = []
+    for _ in 0..<world.count {
+        var d = [UInt8](repeating: 0, count: FeatureSet.descriptorBytes)
+        for b in 0..<FeatureSet.descriptorBytes { d[b] = UInt8(rng.next() & 0xFF) }
+        descriptorFor.append(d)
+    }
+
+    var featureSets: [FeatureSet] = []
+    var intrinsicsByFrame: [Int: CameraIntrinsics] = [:]
+    var visibleWorldIndex: [Int: [Int]] = [:]
+    for frame in 0..<frameCount {
+        var keypoints: [Keypoint] = []
+        var descriptors: [UInt8] = []
+        var visible: [Int] = []
+        for (worldIndex, p) in world.enumerated() {
+            guard let projected = truePoses[frame].project(p, intrinsics: intrinsics),
+                  projected.x > 0, projected.x < 1280, projected.y > 0, projected.y < 720 else { continue }
+            keypoints.append(Keypoint(x: Float(projected.x), y: Float(projected.y), response: 1, angle: 0))
+            descriptors.append(contentsOf: descriptorFor[worldIndex])
+            visible.append(worldIndex)
+        }
+        featureSets.append(FeatureSet(frameIndex: frame, keypoints: keypoints, descriptors: descriptors))
+        intrinsicsByFrame[frame] = intrinsics
+        visibleWorldIndex[frame] = visible
+    }
+    expect(featureSets.allSatisfy { $0.count > 60 }, "every synthetic frame sees enough points")
+
+    guard let (reconstruction, report) = StructureFromMotion.reconstruct(
+        featureSets: featureSets, intrinsics: intrinsicsByFrame,
+        options: SfMOptions(matchWindow: 3, minPairInliers: 30, minInitialAngleDegrees: 1.0)
+    ) else {
+        expect(false, "SfM produced a reconstruction")
+        exit(1)
+    }
+
+    print(String(format: "      registered %d/%d cameras, %d points, RMSE %.4f -> %.4f px",
+                 report.registeredCameras, report.totalCameras, report.points,
+                 report.rmseBefore, report.rmseAfter))
+    expect(report.registeredCameras == frameCount,
+           "all \(frameCount) cameras registered (got \(report.registeredCameras))")
+    expect(report.points > 100, "a substantial point cloud was triangulated (got \(report.points))")
+    expect(report.rmseAfter < 1.0, "final reprojection RMSE is sub-pixel (\(report.rmseAfter))")
+
+    // Geometry check: the reconstruction is only defined up to a similarity
+    // transform, so compare the SHAPE of the camera path — ratios of
+    // consecutive baselines — against the truth, which is scale-invariant.
+    let orderedFrames = reconstruction.cameras.keys.sorted()
+    if orderedFrames.count == frameCount {
+        var estimatedGaps: [Double] = []
+        var trueGaps: [Double] = []
+        for i in 1..<orderedFrames.count {
+            let a = reconstruction.cameras[orderedFrames[i - 1]]!.pose.center
+            let b = reconstruction.cameras[orderedFrames[i]]!.pose.center
+            estimatedGaps.append(LinearAlgebra.length(b - a))
+            trueGaps.append(LinearAlgebra.length(truePoses[i].center - truePoses[i - 1].center))
+        }
+        let scale = estimatedGaps[0] / trueGaps[0]
+        let maxDeviation = zip(estimatedGaps, trueGaps).map { abs($0 / ($1 * scale) - 1) }.max() ?? 1
+        print(String(format: "      camera-path shape: max baseline deviation %.4f", maxDeviation))
+        expect(maxDeviation < 0.05,
+               "camera path matches truth up to a global scale (max dev \(maxDeviation))")
+    }
+
+    // Reproducibility: the same input must give bit-identical output. This is
+    // what the union-find identity fix protects — a hash-keyed track table
+    // would vary per process because Swift seeds hashValue randomly.
+    guard let (again, report2) = StructureFromMotion.reconstruct(
+        featureSets: featureSets, intrinsics: intrinsicsByFrame,
+        options: SfMOptions(matchWindow: 3, minPairInliers: 30, minInitialAngleDegrees: 1.0)
+    ) else {
+        expect(false, "second SfM run produced a reconstruction")
+        exit(1)
+    }
+    expect(report2.points == report.points && report2.registeredCameras == report.registeredCameras,
+           "SfM is reproducible across runs (\(report.points) vs \(report2.points) points)")
+    let samePoses = orderedFrames.allSatisfy { frame in
+        guard let a = reconstruction.cameras[frame], let b = again.cameras[frame] else { return false }
+        return rotationAngleBetween(a.pose.rotation, b.pose.rotation) < 1e-9
+    }
+    expect(samePoses, "SfM camera poses are identical across runs")
+}
+
 print("\n\(passed) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

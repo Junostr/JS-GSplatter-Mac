@@ -35,8 +35,10 @@ case "ingest":
     runIngest(args)
 case "filter":
     runFilter(args)
+case "sfm":
+    runSfM(args)
 default:
-    fail("Unknown command '\(command)'. Commands: probe, ingest, filter", code: 2)
+    fail("Unknown command '\(command)'. Commands: probe, ingest, filter, sfm", code: 2)
 }
 
 // MARK: - probe
@@ -304,6 +306,149 @@ func runFilter(_ args: [String]) {
             fail("Saving selected frames failed: \(error)")
         }
     }
+}
+
+// MARK: - sfm
+
+func runSfM(_ args: [String]) {
+    var inputPath: String?
+    var target = 40
+    var forceCPU = false
+    var plyPath: String?
+
+    var i = 0
+    while i < args.count {
+        let arg = args[i]
+        func value(for flag: String) -> String {
+            i += 1
+            guard i < args.count else { fail("Missing value for \(flag)", code: 2) }
+            return args[i]
+        }
+        switch arg {
+        case "--target":
+            guard let n = Int(value(for: arg)), n > 0 else { fail("--target needs a positive integer", code: 2) }
+            target = n
+        case "--cpu": forceCPU = true
+        case "--ply": plyPath = value(for: arg)
+        default:
+            if arg.hasPrefix("--") { fail("Unknown flag \(arg)", code: 2) }
+            guard inputPath == nil else { fail("Multiple inputs given", code: 2) }
+            inputPath = arg
+        }
+        i += 1
+    }
+    guard let inputPath = inputPath else {
+        fail("Usage: splatctl sfm <photo-folder|video> [--target N] [--cpu] [--ply out.ply]", code: 2)
+    }
+
+    let source: IngestionSource
+    do { source = try IngestionSource.detect(at: URL(fileURLWithPath: inputPath)) }
+    catch { fail("\(error)") }
+
+    let analyzer = FrameAnalyzerFactory.make(forceCPU: forceCPU)
+    let extractor = FeatureExtractorFactory.make(forceCPU: forceCPU)
+    print("=== SfM ===")
+    print("Source:       \(source.frameCountEstimateLabel)")
+    print("Analyzer:     \(analyzer.descriptionForLog)")
+    print("Extractor:    \(extractor.descriptionForLog)")
+
+    // Stage 2 first: pose estimation on blurry or duplicate frames is wasted
+    // work at best and actively harmful at worst.
+    var scores: [FrameScore] = []
+    do {
+        try FrameIngestor.ingest(source) { frame in
+            scores.append(try analyzer.analyze(index: frame.index, timestamp: frame.timestamp,
+                                               pixelBuffer: frame.pixelBuffer))
+            return true
+        }
+    } catch { fail("Analysis failed: \(error)") }
+    // Finer dedup spacing than the stage-2 default. That default asks "is this
+    // frame redundant for viewing?"; SfM asks "do I have enough well-separated
+    // views to triangulate?", and wants far more of them. At the default 0.01
+    // this scene collapsed 72 frames to 5, leaving only adjacent pairs with no
+    // usable baseline.
+    let selection = FrameSelector.select(
+        scores: scores,
+        options: FilterOptions(targetFrameCount: target, dedupMinDistance: 0.001)
+    )
+    let wanted = Set(selection.selected.map { $0.index })
+    print("Filtered:     \(scores.count) → \(selection.selected.count) frames")
+
+    // Stage 3: features on the surviving frames.
+    var featureSets: [FeatureSet] = []
+    var intrinsicsByFrame: [Int: CameraIntrinsics] = [:]
+    let start = Date()
+    do {
+        try FrameIngestor.ingest(source) { frame in
+            guard wanted.contains(frame.index) else { return true }
+            let set = try extractor.extract(index: frame.index, pixelBuffer: frame.pixelBuffer,
+                                            options: FeatureOptions(maxFeatures: 1500))
+            featureSets.append(set)
+            intrinsicsByFrame[frame.index] = CameraIntrinsics.guess(width: frame.width, height: frame.height)
+            return true
+        }
+    } catch { fail("Feature extraction failed: \(error)") }
+    let featureElapsed = Date().timeIntervalSince(start)
+    let totalFeatures = featureSets.reduce(0) { $0 + $1.count }
+    print("Features:     \(totalFeatures) over \(featureSets.count) frames in \(String(format: "%.2f", featureElapsed))s")
+    print("Intrinsics:   focal ≈ \(Int(intrinsicsByFrame.values.first?.focalLength ?? 0)) px (guessed — no EXIF calibration)")
+
+    guard featureSets.count >= 2 else { fail("Need at least 2 usable frames, got \(featureSets.count)") }
+
+    let sfmStart = Date()
+    guard let (reconstruction, report) = StructureFromMotion.reconstruct(
+        featureSets: featureSets, intrinsics: intrinsicsByFrame,
+        log: { print("  \($0)") }
+    ) else {
+        fail("Reconstruction failed — not enough parallax or too few matches.")
+    }
+    let sfmElapsed = Date().timeIntervalSince(sfmStart)
+
+    print("\n=== Reconstruction ===")
+    print("Cameras:      \(report.registeredCameras)/\(report.totalCameras) registered")
+    print("Points:       \(report.points)")
+    print("RMSE:         \(String(format: "%.3f", report.rmseBefore)) → \(String(format: "%.3f", report.rmseAfter)) px")
+    print("Elapsed:      \(String(format: "%.2f", sfmElapsed))s")
+    if report.registeredCameras < report.totalCameras {
+        print("Note:         \(report.totalCameras - report.registeredCameras) frame(s) could not be registered.")
+    }
+
+    if let plyPath = plyPath {
+        do {
+            try writePLY(reconstruction: reconstruction, to: URL(fileURLWithPath: plyPath))
+            print("Wrote:        \(plyPath)")
+        } catch {
+            fail("Could not write PLY: \(error)")
+        }
+    }
+}
+
+/// Minimal ASCII PLY of the sparse cloud plus camera centres. A debugging aid
+/// for inspecting a reconstruction in MeshLab/CloudCompare — the real export
+/// pipeline is stage 7.
+func writePLY(reconstruction: Reconstruction, to url: URL) throws {
+    var lines: [String] = []
+    let cameraCentres = reconstruction.cameras.keys.sorted().compactMap { reconstruction.cameras[$0]?.pose.center }
+    let total = reconstruction.points.count + cameraCentres.count
+    lines.append("ply")
+    lines.append("format ascii 1.0")
+    lines.append("comment sparse reconstruction from GaussianSplatter stage 3")
+    lines.append("element vertex \(total)")
+    lines.append("property float x")
+    lines.append("property float y")
+    lines.append("property float z")
+    lines.append("property uchar red")
+    lines.append("property uchar green")
+    lines.append("property uchar blue")
+    lines.append("end_header")
+    for point in reconstruction.points {
+        lines.append("\(point.position.x) \(point.position.y) \(point.position.z) 200 200 200")
+    }
+    // Cameras in red so the path is visible against the cloud.
+    for centre in cameraCentres {
+        lines.append("\(centre.x) \(centre.y) \(centre.z) 255 40 40")
+    }
+    try lines.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
 }
 
 func writeJPEG(_ frame: IngestedFrame, to url: URL) throws {
