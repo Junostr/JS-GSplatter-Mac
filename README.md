@@ -155,9 +155,38 @@ Implemented:
     loop, because the orbit does not register all the way round for both ends to
     exist simultaneously.
 
-    Registration still stops at ~20/60 with late-orbit PnP ratios decaying
-    (14/124), consistent with accumulating drift at the widest viewpoint
-    changes.
+    **SIFT-like descriptors** (`SIFTDescriptor`, now the default;
+    `FeatureOptions.descriptorKind` selects, `splatctl sfm --brief` reverts).
+    BRIEF compares raw intensities at point pairs and degrades once appearance
+    changes — exactly the wide-viewpoint case that limited registration. A
+    128-dimension gradient-orientation histogram (4x4 cells x 8 bins, trilinear
+    interpolation, normalize/clip/renormalize) discards absolute intensity and
+    records only edge direction. Verified: under a contrast x0.55 plus
+    brightness +0.2 change the descriptor distance is **0**, against 408939 for
+    a genuinely different patch.
+
+    A/B on the real capture, same everything else:
+
+    | descriptor | cameras | points | RMSE |
+    |---|---|---|---|
+    | BRIEF (256-bit, Hamming) | 17/60 | 2048 | 1.18 px |
+    | SIFT-like (128-D, L2) | **25-29/60** | 3326 | 1.46 px |
+
+    Descriptor kind is carried on `FeatureSet`, so the matcher picks Hamming or
+    squared-L2 from the data rather than a global assumption. Note the ratio
+    test is squared for the L2 path — Lowe's 0.8 is defined on Euclidean
+    distance, and applying it unsquared to squared distances would silently
+    impose a much stricter 0.894 and discard many correct matches.
+
+    Registration reaches roughly half the orbit. Late-orbit PnP ratios still
+    decay, consistent with accumulating drift at the widest viewpoint changes.
+
+    **Unresolved:** the A/B above measured 25/60 for SIFT, while two
+    back-to-back runs immediately afterwards both gave 29/60 with an unchanged
+    binary. Consecutive runs are reproducible, so the earlier sorted-iteration
+    fix did help, but this discrepancy is unexplained and suggests some residual
+    run-to-run variability remains. Worth chasing before trusting any small
+    measured difference in this pipeline.
 
     Practical note meanwhile: prefer `--target 60` or higher on real captures.
     Denser sampling costs little and matters more than any tuning knob here.

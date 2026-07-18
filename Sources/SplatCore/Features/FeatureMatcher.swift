@@ -33,11 +33,13 @@ public struct MatchOptions {
     /// many-to-one failure the ratio test alone permits, at the cost of a
     /// second pass.
     public var crossCheck: Bool
-    /// Hard ceiling on Hamming distance (0…256). Beyond ~30% of the bits
-    /// differing, two BRIEF descriptors carry essentially no shared signal.
-    public var maxDistance: Int
+    /// Hard ceiling on descriptor distance. nil selects a value appropriate to
+    /// the descriptor kind — the two metrics have entirely different scales
+    /// (Hamming is 0…256; squared L2 over 128 bytes runs to millions), so a
+    /// single hardcoded number would silently reject everything for one of them.
+    public var maxDistance: Int?
 
-    public init(ratioThreshold: Float = 0.8, crossCheck: Bool = true, maxDistance: Int = 80) {
+    public init(ratioThreshold: Float = 0.8, crossCheck: Bool = true, maxDistance: Int? = nil) {
         self.ratioThreshold = ratioThreshold
         self.crossCheck = crossCheck
         self.maxDistance = maxDistance
@@ -45,6 +47,40 @@ public struct MatchOptions {
 }
 
 public enum FeatureMatcher {
+
+    /// Distance between two descriptors under the metric their kind requires.
+    @inline(__always)
+    public static func distance(_ a: ArraySlice<UInt8>, _ b: ArraySlice<UInt8>, kind: DescriptorKind) -> Int {
+        switch kind {
+        case .brief: return hamming(a, b)
+        case .sift: return SIFTDescriptor.squaredDistance(a, b)
+        }
+    }
+
+    static func defaultMaxDistance(for kind: DescriptorKind) -> Int {
+        switch kind {
+        // Beyond ~30% of bits differing, two BRIEF descriptors share no signal.
+        case .brief: return 80
+        // Squared L2 on 512-scaled unit vectors. Generous on purpose: Lowe's
+        // method leans on the RATIO test for rejection, and an absolute cap
+        // this loose only removes the obviously hopeless.
+        case .sift: return 120_000
+        }
+    }
+
+    /// The ratio test threshold to apply to whatever metric is in use.
+    ///
+    /// Lowe's 0.8 is defined on Euclidean distance. We compare SQUARED L2 to
+    /// stay in integers, and squaring is monotonic, so the equivalent test on
+    /// squared values is d1² < t² · d2². Forgetting to square here would apply
+    /// a far stricter 0.8 on squared distance — equivalent to 0.894 Euclidean —
+    /// and quietly discard a large share of correct matches.
+    static func effectiveRatio(_ ratio: Float, kind: DescriptorKind) -> Float {
+        switch kind {
+        case .brief: return ratio
+        case .sift: return ratio * ratio
+        }
+    }
 
     /// Hamming distance between two 256-bit descriptors.
     @inline(__always)
@@ -82,10 +118,13 @@ public enum FeatureMatcher {
         query: FeatureSet, train: FeatureSet,
         queryPose: CameraPose, trainPose: CameraPose,
         queryIntrinsics: CameraIntrinsics, trainIntrinsics: CameraIntrinsics,
-        options: MatchOptions = MatchOptions(ratioThreshold: 0.95, crossCheck: false, maxDistance: 100),
+        options: MatchOptions = MatchOptions(ratioThreshold: 0.95, crossCheck: false),
         epipolarThresholdPixels: Double = 4.0
     ) -> [FeatureMatch] {
-        guard query.count > 0, train.count > 0 else { return [] }
+        guard query.count > 0, train.count > 0, query.kind == train.kind else { return [] }
+        let kind = query.kind
+        let maxDistance = options.maxDistance ?? defaultMaxDistance(for: kind)
+        let ratio = effectiveRatio(options.ratioThreshold, kind: kind)
 
         // Relative pose train <- query, then E = [t]x R in normalized coords.
         let rQuery = queryPose.rotation, rTrain = trainPose.rotation
@@ -123,7 +162,7 @@ public enum FeatureMatcher {
                 let b = trainNormalized[t]
                 let distanceToLine = abs(b.x * line.x + b.y * line.y + line.z) / norm
                 guard distanceToLine < epipolarThreshold else { continue }
-                let distance = hamming(qd, train.descriptor(at: t))
+                let distance = distance(qd, train.descriptor(at: t), kind: kind)
                 if distance < best {
                     secondBest = best
                     best = distance
@@ -132,12 +171,12 @@ public enum FeatureMatcher {
                     secondBest = distance
                 }
             }
-            guard bestIndex >= 0, best <= options.maxDistance else { continue }
+            guard bestIndex >= 0, best <= maxDistance else { continue }
             // The ratio test still runs, but only among candidates that already
             // satisfy the epipolar constraint — so it is discriminating between
             // genuinely plausible correspondences rather than the whole image.
             if secondBest < Int.max {
-                guard Float(best) < options.ratioThreshold * Float(secondBest) else { continue }
+                guard Float(best) < ratio * Float(secondBest) else { continue }
             }
             // One-to-one: a train feature cannot serve two query features.
             claimed[bestIndex] = true
@@ -157,7 +196,10 @@ public enum FeatureMatcher {
     public static func match(
         query: FeatureSet, train: FeatureSet, options: MatchOptions = MatchOptions()
     ) -> [FeatureMatch] {
-        guard query.count > 0, train.count > 0 else { return [] }
+        guard query.count > 0, train.count > 0, query.kind == train.kind else { return [] }
+        let kind = query.kind
+        let maxDistance = options.maxDistance ?? defaultMaxDistance(for: kind)
+        let ratio = effectiveRatio(options.ratioThreshold, kind: kind)
 
         var forward = [FeatureMatch]()
         forward.reserveCapacity(query.count)
@@ -166,7 +208,7 @@ public enum FeatureMatcher {
             let qd = query.descriptor(at: q)
             var best = Int.max, secondBest = Int.max, bestIndex = -1
             for t in 0..<train.count {
-                let distance = hamming(qd, train.descriptor(at: t))
+                let distance = distance(qd, train.descriptor(at: t), kind: kind)
                 if distance < best {
                     secondBest = best
                     best = distance
@@ -175,12 +217,12 @@ public enum FeatureMatcher {
                     secondBest = distance
                 }
             }
-            guard bestIndex >= 0, best <= options.maxDistance else { continue }
+            guard bestIndex >= 0, best <= maxDistance else { continue }
             // With only one train feature there is no second-best to compare
             // against; accept on the distance ceiling alone rather than
             // dividing by Int.max and rejecting everything.
             if train.count > 1 {
-                guard Float(best) < options.ratioThreshold * Float(secondBest) else { continue }
+                guard Float(best) < ratio * Float(secondBest) else { continue }
             }
             forward.append(FeatureMatch(queryIndex: q, trainIndex: bestIndex, distance: best))
         }
@@ -194,7 +236,7 @@ public enum FeatureMatcher {
         for t in 0..<train.count {
             let td = train.descriptor(at: t)
             for q in 0..<query.count {
-                let distance = hamming(td, query.descriptor(at: q))
+                let distance = distance(td, query.descriptor(at: q), kind: kind)
                 if distance < bestDistanceForTrain[t] {
                     bestDistanceForTrain[t] = distance
                     bestQueryForTrain[t] = q

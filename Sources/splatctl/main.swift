@@ -398,6 +398,7 @@ func runSfM(_ args: [String]) {
     var forceCPU = false
     var plyPath: String?
     var focalOverride: Double?
+    var descriptorKind: DescriptorKind = .sift
 
     var i = 0
     while i < args.count {
@@ -415,6 +416,7 @@ func runSfM(_ args: [String]) {
             guard let v = Double(value(for: arg)), v > 0 else { fail("--focal needs a positive number", code: 2) }
             focalOverride = v
         case "--cpu": forceCPU = true
+        case "--brief": descriptorKind = .brief
         case "--ply": plyPath = value(for: arg)
         default:
             if arg.hasPrefix("--") { fail("Unknown flag \(arg)", code: 2) }
@@ -437,6 +439,7 @@ func runSfM(_ args: [String]) {
     print("Source:       \(source.frameCountEstimateLabel)")
     print("Analyzer:     \(analyzer.descriptionForLog)")
     print("Extractor:    \(extractor.descriptionForLog)")
+    print("Descriptor:   \(descriptorKind.rawValue)")
 
     // Stage 2 first: pose estimation on blurry or duplicate frames is wasted
     // work at best and actively harmful at worst.
@@ -469,7 +472,8 @@ func runSfM(_ args: [String]) {
         try FrameIngestor.ingest(source) { frame in
             guard wanted.contains(frame.index) else { return true }
             let set = try extractor.extract(index: frame.index, pixelBuffer: frame.pixelBuffer,
-                                            options: FeatureOptions(maxFeatures: 1500))
+                                            options: FeatureOptions(maxFeatures: 1500,
+                                                                    descriptorKind: descriptorKind))
             featureSets.append(set)
             frameWidth = frame.width; frameHeight = frame.height
             var intr = CameraIntrinsics.guess(width: frame.width, height: frame.height)

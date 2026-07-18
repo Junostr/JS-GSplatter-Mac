@@ -44,27 +44,51 @@ public struct Keypoint: Equatable {
     }
 }
 
-/// Keypoints plus their packed binary descriptors for one frame.
+/// Which descriptor a FeatureSet holds, and therefore which distance metric
+/// the matcher must use. Carried on the data rather than assumed globally, so
+/// mixing sets built with different settings is a type-level impossibility
+/// rather than a silent wrong answer.
+public enum DescriptorKind: String, Codable {
+    /// 256-bit steered BRIEF, compared with Hamming distance.
+    case brief
+    /// 128-dimension gradient-orientation histogram, compared with squared L2.
+    case sift
+
+    public var byteCount: Int {
+        switch self {
+        case .brief: return 32
+        case .sift: return SIFTDescriptor.dimensions
+        }
+    }
+}
+
+/// Keypoints plus their packed descriptors for one frame.
 public struct FeatureSet {
     public static let descriptorBits = 256
+    /// BRIEF's size. Prefer `kind.byteCount` — this remains for the binary path.
     public static let descriptorBytes = descriptorBits / 8   // 32
 
     public let frameIndex: Int
     public let keypoints: [Keypoint]
-    /// Row-major, `keypoints.count * descriptorBytes` bytes.
+    /// Row-major, `keypoints.count * kind.byteCount` bytes.
     public let descriptors: [UInt8]
+    public let kind: DescriptorKind
 
-    public init(frameIndex: Int, keypoints: [Keypoint], descriptors: [UInt8]) {
+    public init(frameIndex: Int, keypoints: [Keypoint], descriptors: [UInt8],
+                kind: DescriptorKind = .brief) {
         self.frameIndex = frameIndex
         self.keypoints = keypoints
         self.descriptors = descriptors
+        self.kind = kind
     }
 
     public var count: Int { keypoints.count }
+    public var descriptorByteCount: Int { kind.byteCount }
 
     public func descriptor(at index: Int) -> ArraySlice<UInt8> {
-        let start = index * FeatureSet.descriptorBytes
-        return descriptors[start..<(start + FeatureSet.descriptorBytes)]
+        let bytes = kind.byteCount
+        let start = index * bytes
+        return descriptors[start..<(start + bytes)]
     }
 }
 
@@ -139,9 +163,19 @@ public struct FeatureOptions {
     /// the coarse steps are enough for the failure being addressed here.
     public var pyramidLevels: Int
 
+    /// Which descriptor to compute. SIFT-like is the default: BRIEF compares
+    /// raw intensities at point pairs and degrades sharply once appearance
+    /// changes, which is what limited registration at the wide viewpoint
+    /// changes late in an orbit. A gradient-orientation histogram discards
+    /// absolute intensity and records only edge-direction distribution, so it
+    /// survives lighting change and moderate warps. It costs 4x the bytes and
+    /// more compute per keypoint; both are cheap next to the response map.
+    public var descriptorKind: DescriptorKind
+
     public init(maxFeatures: Int = 2000, relativeThreshold: Float = 0.01, nmsRadius: Int = 4,
                 spatialBuckets: Int = 8, noiseFloorFraction: Float = 0.0005,
-                pyramidLevels: Int = 4) {
+                pyramidLevels: Int = 4, descriptorKind: DescriptorKind = .sift) {
+        self.descriptorKind = descriptorKind
         self.maxFeatures = maxFeatures
         self.relativeThreshold = relativeThreshold
         self.nmsRadius = nmsRadius
@@ -487,8 +521,14 @@ public enum FeatureMath {
                 // Descriptor is sampled on THIS level, so it covers a patch
                 // `scale` times larger in original pixels — which is exactly
                 // what gives scale invariance.
-                descriptors.append(contentsOf: describe(
-                    luma: level.luma, width: level.width, height: level.height, keypoint: keypoint))
+                switch options.descriptorKind {
+                case .brief:
+                    descriptors.append(contentsOf: describe(
+                        luma: level.luma, width: level.width, height: level.height, keypoint: keypoint))
+                case .sift:
+                    descriptors.append(contentsOf: SIFTDescriptor.describe(
+                        luma: level.luma, width: level.width, height: level.height, keypoint: keypoint))
+                }
                 // Map back to full-resolution coordinates. The +0.5 centring
                 // accounts for a level pixel covering a `scale`-wide block.
                 keypoints.append(Keypoint(
@@ -520,7 +560,7 @@ public enum FeatureMath {
                 if keypoints[a].y != keypoints[b].y { return keypoints[a].y < keypoints[b].y }
                 return keypoints[a].x < keypoints[b].x
             }
-            let bytes = FeatureSet.descriptorBytes
+            let bytes = options.descriptorKind.byteCount
             var sortedKeypoints = [Keypoint](); sortedKeypoints.reserveCapacity(order.count)
             var sortedDescriptors = [UInt8](); sortedDescriptors.reserveCapacity(descriptors.count)
             for index in order {
@@ -530,7 +570,8 @@ public enum FeatureMath {
             keypoints = sortedKeypoints
             descriptors = sortedDescriptors
         }
-        return FeatureSet(frameIndex: frameIndex, keypoints: keypoints, descriptors: descriptors)
+        return FeatureSet(frameIndex: frameIndex, keypoints: keypoints,
+                          descriptors: descriptors, kind: options.descriptorKind)
     }
 
     /// Build the full FeatureSet from a response map. Shared tail of both

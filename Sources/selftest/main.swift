@@ -632,8 +632,8 @@ do {
         let options = FeatureOptions(maxFeatures: 500)
         let c = try cpu.extract(index: frame.index, pixelBuffer: frame.pixelBuffer, options: options)
         expect(c.count > 20, "CPU finds a meaningful number of corners (got \(c.count))")
-        expect(c.descriptors.count == c.count * FeatureSet.descriptorBytes,
-               "descriptor buffer size matches keypoint count")
+        expect(c.descriptors.count == c.count * c.descriptorByteCount,
+               "descriptor buffer size matches keypoint count (\(c.kind.rawValue), \(c.descriptorByteCount) B)")
         // Responses arrive strongest-first, but only up to the sort's
         // quantization grid: within one bucket the order is spatial, so the
         // raw response may tick upward by less than one grid step. Asserting
@@ -1003,6 +1003,47 @@ do {
     expect(TwoViewGeometry.estimate(matches: few, keypoints1: kps, keypoints2: kps,
                                     intrinsics1: intrinsics, intrinsics2: intrinsics) == nil,
            "fewer than 8 matches yields no result")
+}
+
+print("SIFT-like descriptor:")
+do {
+    // A textured patch, and the SAME patch under a large global illumination
+    // change (contrast scaled, brightness shifted). A gradient-ORIENTATION
+    // histogram should barely notice, because it normalizes away magnitude and
+    // records only edge direction — that invariance is the entire reason to
+    // pay 4x the bytes over BRIEF.
+    let w = 96, h = 96
+    var base = [Float](repeating: 0, count: w * h)
+    var rng = SplitMix64(seed: 777)
+    for y in 0..<h {
+        for x in 0..<w {
+            let wave = sin(Float(x) * 0.4) * cos(Float(y) * 0.3) * 0.25
+            base[y * w + x] = 0.5 + wave + (rng.nextUniform() - 0.5) * 0.02
+        }
+    }
+    // Illumination change: contrast x0.55, brightness +0.2 — well beyond
+    // anything a real capture would see between adjacent frames.
+    let relit = base.map { Swift.min(1, Swift.max(0, $0 * 0.55 + 0.2)) }
+
+    let kp = Keypoint(x: 48, y: 48, response: 1, angle: 0.4)
+    let d1 = SIFTDescriptor.describe(luma: base, width: w, height: h, keypoint: kp)
+    let d2 = SIFTDescriptor.describe(luma: relit, width: w, height: h, keypoint: kp)
+    expect(d1.count == 128, "descriptor is 128 dimensions (got \(d1.count))")
+
+    let selfDistance = SIFTDescriptor.squaredDistance(d1[0...127], d1[0...127])
+    expect(selfDistance == 0, "distance to itself is zero")
+
+    let relitDistance = SIFTDescriptor.squaredDistance(d1[0...127], d2[0...127])
+    // Compare against a genuinely different patch to show the metric has range.
+    let elsewhere = Keypoint(x: 30, y: 66, response: 1, angle: 2.1)
+    let d3 = SIFTDescriptor.describe(luma: base, width: w, height: h, keypoint: elsewhere)
+    let differentDistance = SIFTDescriptor.squaredDistance(d1[0...127], d3[0...127])
+    print(String(format: "      relit patch distance %d vs different patch %d", relitDistance, differentDistance))
+    expect(relitDistance < differentDistance / 4,
+           "illumination change costs far less than a genuine content change (\(relitDistance) vs \(differentDistance))")
+
+    // Non-degenerate: a real patch must not produce an all-zero vector.
+    expect(d1.contains { $0 > 0 }, "descriptor is non-degenerate")
 }
 
 print("Guided epipolar matching:")
