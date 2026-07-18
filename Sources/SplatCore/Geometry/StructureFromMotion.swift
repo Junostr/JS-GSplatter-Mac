@@ -25,7 +25,7 @@ public struct SfMOptions {
     public var bundleAdjust: Bool
 
     public init(matchWindow: Int = 6, maxFeaturesPerFrame: Int = 1500,
-                minPairInliers: Int = 30, minInitialAngleDegrees: Double = 3.0,
+                minPairInliers: Int = 30, minInitialAngleDegrees: Double = 1.2,
                 bundleAdjust: Bool = true) {
         self.matchWindow = matchWindow
         self.maxFeaturesPerFrame = maxFeaturesPerFrame

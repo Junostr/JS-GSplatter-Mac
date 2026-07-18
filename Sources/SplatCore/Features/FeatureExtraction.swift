@@ -100,12 +100,25 @@ public struct FeatureOptions {
     /// mature SfM implementation does some version of this.
     public var spatialBuckets: Int
 
+    /// Absolute floor for the per-cell threshold, as a fraction of the frame's
+    /// global maximum response.
+    ///
+    /// The threshold is computed PER CELL (see `relativeThreshold`), which is
+    /// what lets a low-contrast or defocused region still contribute its best
+    /// corners. But a cell containing only flat wall or sky has a maximum that
+    /// is pure noise, and 1% of noise is still noise — without a floor those
+    /// cells would fill up with garbage. This floor is deliberately very low
+    /// (0.05% of the global max): high enough to reject sensor noise, low
+    /// enough not to reintroduce the global-threshold problem it exists to fix.
+    public var noiseFloorFraction: Float
+
     public init(maxFeatures: Int = 2000, relativeThreshold: Float = 0.01, nmsRadius: Int = 4,
-                spatialBuckets: Int = 8) {
+                spatialBuckets: Int = 8, noiseFloorFraction: Float = 0.0005) {
         self.maxFeatures = maxFeatures
         self.relativeThreshold = relativeThreshold
         self.nmsRadius = nmsRadius
         self.spatialBuckets = spatialBuckets
+        self.noiseFloorFraction = noiseFloorFraction
     }
 }
 
@@ -230,15 +243,50 @@ public enum FeatureMath {
         guard width > 2, height > 2, !response.isEmpty else { return [] }
         let maxResponse = response.max() ?? 0
         guard maxResponse > 0 else { return [] }
-        let threshold = maxResponse * options.relativeThreshold
         let r = max(1, options.nmsRadius)
+
+        // PER-CELL thresholds, not one global cutoff.
+        //
+        // A single `relativeThreshold * globalMax` cutoff means the frame's
+        // most contrasty object decides what counts as a feature everywhere.
+        // Observed on a real capture: one ornately engraved brass tray set the
+        // global maximum so high that a fully textured room — wood floor,
+        // furniture, patterned fabric — fell entirely below the floor and
+        // contributed almost no features, leaving the reconstruction to rely
+        // on a single small, near-planar object.
+        //
+        // Scaling the threshold to each cell's own maximum lets every region
+        // contribute its best corners on its own terms, which is what spreads
+        // features across the frame. (Spatial bucketing alone does not do this:
+        // it only rebalances once the maxFeatures cap binds, and if the
+        // threshold already rejected a region there is nothing left to
+        // rebalance.)
+        let grid = max(1, options.spatialBuckets)
+        var cellMax = [Float](repeating: 0, count: grid * grid)
+        for y in r..<(height - r) {
+            let row = y * width
+            let cy = min(grid - 1, y * grid / height)
+            for x in r..<(width - r) {
+                let value = response[row + x]
+                let cx = min(grid - 1, x * grid / width)
+                let cell = cy * grid + cx
+                if value > cellMax[cell] { cellMax[cell] = value }
+            }
+        }
+        let noiseFloor = maxResponse * options.noiseFloorFraction
+        var cellThreshold = [Float](repeating: 0, count: grid * grid)
+        for i in 0..<(grid * grid) {
+            cellThreshold[i] = max(cellMax[i] * options.relativeThreshold, noiseFloor)
+        }
 
         var candidates: [(index: Int, x: Int, y: Int, value: Float)] = []
         for y in r..<(height - r) {
             let row = y * width
+            let cy = min(grid - 1, y * grid / height)
             for x in r..<(width - r) {
                 let value = response[row + x]
-                guard value >= threshold else { continue }
+                let cx = min(grid - 1, x * grid / width)
+                guard value >= cellThreshold[cy * grid + cx] else { continue }
                 // Strict non-maximum suppression over the (2r+1)^2 window.
                 // Ties are broken by scan order via the `>=` on earlier
                 // pixels, so the result is deterministic.
