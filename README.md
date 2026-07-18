@@ -4,7 +4,7 @@ Native macOS app that converts a photo series or video into a 3D Gaussian
 Splat. Universal binary (arm64 + x86_64), deployment target **macOS 11.0
 (Big Sur)**, GPU compute via raw Metal — no CUDA anywhere.
 
-## Status: stages 1 (ingestion), 2 (filtering), 4 (capability probe)
+## Status: stages 1 (ingestion), 2 (filtering), 3 (features, partial), 4 (probe)
 
 Implemented:
 - **Ingestion** (`SplatCore/Ingestion/`) — photo folders (ImageIO: EXIF
@@ -26,6 +26,32 @@ Implemented:
   downsampling to a target count. CLI: `splatctl filter <folder|video>
   [--target N] [--cpu] [--save dir] [--verbose]`. On an M1 Pro the Metal
   path runs ~37× faster than the CPU fallback (510 vs 14 frames/s at 640×480).
+- **Feature extraction + matching** (`SplatCore/Features/`) — first half of
+  stage 3. `FeatureExtractor` protocol with a Metal baseline (Harris corner
+  response) and an Accelerate CPU fallback; ORB-style intensity-centroid
+  orientation and steered 256-bit BRIEF descriptors; brute-force Hamming
+  matching with Lowe's ratio test and cross-check. Only *detection* is
+  tier-specific — orientation and descriptors are shared code, so descriptor
+  parity is structural rather than tested-into-existence.
+
+  Two precision landmines this stage hit, both worth knowing before touching
+  the kernels:
+  - **Metal's fast math is on by default** and contracts the Harris
+    determinant (`sxx*syy − sxy*sxy`, a difference of similar large products)
+    into an FMA. That is catastrophic cancellation, so last-bit input noise
+    became visibly different responses. It is explicitly disabled. Stage 2's
+    kernels are unaffected — variance is a well-conditioned sum of squares.
+  - **The tiers' response maps still differ by ~1 ULP**, which is inherent.
+    Keypoints are therefore sorted on a response *quantized* to a 2²⁰ grid
+    with a spatial tiebreak. Not cosmetic: `maxFeatures` truncates that list,
+    so an unstable order would let the tiers keep different feature *subsets*
+    at the cut line. (A total order, deliberately — an epsilon-tolerant
+    comparator is non-transitive and makes `sort()` undefined behavior.)
+
+  The cross-tier contract is consequently *interchangeable feature sets
+  matched by position*, not identical array ordering — the latter isn't a
+  promise that can hold across Nvidia/AMD/Apple GPUs. Verified identical on
+  two different GPUs (M1 Pro and CI's paravirtual device).
 - **App shell** (`App/`) — SwiftUI drag-and-drop UI (macOS 11-safe API
   surface only): shows the tier decision with reasons and a force-baseline
   toggle, accepts a dropped photo folder or video, runs ingestion off-main
@@ -47,7 +73,8 @@ Implemented:
   and drives the selected engine stub. `--force-baseline` overrides enhanced
   tier for testing; `--json` emits the full report machine-readably.
 
-Not yet implemented: SfM (stage 3), real training kernels (stage 5),
+Not yet implemented: the rest of stage 3 (geometric verification, incremental
+pose estimation, triangulation, bundle adjustment), real training kernels (stage 5),
 viewer (stage 6), export (stage 7).
 
 ## Tier architecture
@@ -72,7 +99,7 @@ Three build paths, each with a distinct purpose:
 **1. Everyday development — SPM (CLT is enough for arm64):**
 ```sh
 swift run splatctl [probe|ingest|filter] ...
-swift run selftest        # test suite (78 assertions, synthesizes its own fixtures)
+swift run selftest        # test suite (98 assertions, synthesizes its own fixtures)
 ```
 Note: on macOS 27 tooling these local builds get a 12.0 deployment floor
 (see below) — fine for development, not for release. The arm64 slice builds
