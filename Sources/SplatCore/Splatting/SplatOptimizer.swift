@@ -84,8 +84,23 @@ public struct OptimizerOptions {
 }
 
 public struct DensityOptions {
-    /// Average screen-space gradient above which a splat is considered
-    /// under-reconstructed and gets densified.
+    /// Fraction of visible splats to densify each pass, chosen by ranking
+    /// their average screen-space gradient.
+    ///
+    /// A PERCENTILE rather than an absolute gradient threshold, because an
+    /// absolute one is not portable across loss normalisations. The published
+    /// 3DGS value (0.0002) assumes their loss scaling; this pipeline averages
+    /// L1 over every pixel and channel, so at 240x135 the gradients are ~1e-5
+    /// and that threshold is never reached. Measured consequence: 0 clones and
+    /// 0 splits across an entire 200-iteration run, so the splat count could
+    /// only shrink and no detail could ever be added — density control present
+    /// but silently inert.
+    ///
+    /// Ranking is invariant to that scaling: the top few percent of splats by
+    /// gradient are the under-reconstructed ones whatever the units.
+    public var densifyFraction: Float
+    /// Absolute floor, so a converged scene with uniformly tiny gradients is
+    /// not densified purely because some splat has to be in the top percentile.
     public var gradientThreshold: Float
     /// World-space size, as a fraction of scene extent, separating "too small,
     /// clone it" from "too large, split it".
@@ -105,9 +120,11 @@ public struct DensityOptions {
     /// together while each resolving finer detail.
     public var splitScaleDivisor: Float
 
-    public init(gradientThreshold: Float = 0.0002, sizeThreshold: Float = 0.01,
+    public init(densifyFraction: Float = 0.05, gradientThreshold: Float = 1e-9,
+                sizeThreshold: Float = 0.01,
                 minOpacity: Float = 0.005, maxWorldSize: Float = 0.1,
                 splitSeparation: Float = 1.0, splitScaleDivisor: Float = 1.6) {
+        self.densifyFraction = densifyFraction
         self.gradientThreshold = gradientThreshold
         self.sizeThreshold = sizeThreshold
         self.minOpacity = minOpacity
@@ -212,17 +229,29 @@ public final class SplatOptimizer {
         guard cloud.count > 0 else { return DensityReport(cloned: 0, split: 0, pruned: 0, finalCount: 0) }
 
         let sizeLimit = densityOptions.sizeThreshold * sceneExtent
+
+        // Rank visible splats by average screen gradient and take the top
+        // fraction, subject to the absolute floor.
+        var ranked: [(index: Int, gradient: Float)] = []
+        ranked.reserveCapacity(cloud.count)
+        for i in 0..<cloud.count where gradients.visibleCount[i] > 0 {
+            let average = gradients.screenGradient[i] / Float(gradients.visibleCount[i])
+            if average > densityOptions.gradientThreshold { ranked.append((i, average)) }
+        }
+        // Sorted by gradient, index breaking ties so densification is
+        // deterministic rather than depending on sort stability.
+        ranked.sort { $0.gradient != $1.gradient ? $0.gradient > $1.gradient : $0.index < $1.index }
+        let densifyCount = min(ranked.count,
+                               max(0, Int((Float(ranked.count) * densityOptions.densifyFraction).rounded())))
+        let selected = Set(ranked.prefix(densifyCount).map { $0.index })
+
         var cloned = 0, split = 0
         var doomed = Set<Int>()
         var additions: [Splat] = []
 
         let originalCount = cloud.count
         for i in 0..<originalCount {
-            let views = gradients.visibleCount[i]
-            guard views > 0 else { continue }
-            let averageGradient = gradients.screenGradient[i] / Float(views)
-            guard averageGradient > densityOptions.gradientThreshold else { continue }
-
+            guard selected.contains(i) else { continue }
             let splat = cloud[i]
             let maxScale = max(splat.scale.x, max(splat.scale.y, splat.scale.z))
 

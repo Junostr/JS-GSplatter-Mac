@@ -482,6 +482,28 @@ Implemented:
   to prune, so each split is undone in the same pass and its children
   discarded — measured as 4 pruned instead of 2. Defaults leave a 10× band.
 
+- **End-to-end training** — `splatctl train <input> [--target N]
+  [--iterations N] [--scale N] [--save dir]` runs ingestion → filtering → SfM →
+  splat init → training, and dumps trained renders beside their references.
+
+  **It reconstructs the real capture.** From 20 registered views at 240×135,
+  200 iterations: loss **0.166 → 0.063 (62% reduction)** in 165 s on CPU, splat
+  count growing 1953 → 2240, and the render is recognisably the scene — the
+  brass tray, the plant, the wooden furniture and the couch all in the right
+  places with the right colours. Blurry, as 200 iterations at 1/16 resolution
+  should be (reference 3DGS runs 30 000), but this is a real Gaussian-splat
+  reconstruction rather than a plausible-looking test.
+
+  Running it exposed a bug that only appears on real data: densification never
+  fired — **0 clones and 0 splits across a whole run**, so the splat count could
+  only shrink and no detail could ever be added. The published 3DGS gradient
+  threshold (0.0002) assumes that project's loss scaling; this pipeline averages
+  L1 over every pixel and channel, so gradients are ~1e-5 and the threshold was
+  never reachable. Density control was present, tested, and silently inert.
+  Fixed by ranking splats and densifying the top `densifyFraction` — a
+  percentile is invariant to loss normalisation where an absolute threshold is
+  not. After the fix: +55 cloned / +43 split on the first pass.
+
 Not yet implemented: checkpoint/resume, the Metal kernels for the splatting
 path, viewer (stage 6), export (stage 7), and homography-based initialization
 for planar scenes.

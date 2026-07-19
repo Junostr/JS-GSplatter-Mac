@@ -2021,6 +2021,7 @@ do {
     var gradients = SplatGradients(count: cloud.count)
     gradients.screenGradient = [1.0, 1.0, 0.0, 0.0]      // splats 0 and 1 are being pulled
     gradients.visibleCount = [1, 1, 1, 1]
+    // Two of four splats have gradient, so half of the ranked set densifies.
 
     let optimizer = SplatOptimizer(splatCount: cloud.count)
     let extent = SplatOptimizer.sceneExtent(of: cloud)
@@ -2034,6 +2035,7 @@ do {
     // splat can be refined instead of deleted.
     density.sizeThreshold = 0.02
     density.maxWorldSize = 0.5
+    density.densifyFraction = 1.0   // densify every splat above the floor
     let report = optimizer.densifyAndPrune(cloud: &cloud, gradients: gradients,
                                            sceneExtent: extent, options: density)
     print("      cloned \(report.cloned), split \(report.split), pruned \(report.pruned), final \(report.finalCount)")

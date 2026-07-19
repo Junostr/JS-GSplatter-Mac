@@ -1,3 +1,4 @@
+import CoreVideo
 import Foundation
 import ImageIO
 import SplatCore
@@ -41,8 +42,10 @@ case "features":
     runFeatures(args)
 case "render":
     runRender(args)
+case "train":
+    runTrain(args)
 default:
-    fail("Unknown command '\(command)'. Commands: probe, ingest, filter, sfm, features, render", code: 2)
+    fail("Unknown command '\(command)'. Commands: probe, ingest, filter, sfm, features, render, train", code: 2)
 }
 
 // MARK: - probe
@@ -309,6 +312,205 @@ func runFilter(_ args: [String]) {
         } catch {
             fail("Saving selected frames failed: \(error)")
         }
+    }
+}
+
+// MARK: - train (stage 5 end to end)
+
+/// Box-downsample a BGRA pixel buffer straight into planar float RGB.
+///
+/// Training runs at reduced resolution: the CPU rasterizer costs O(pixels x
+/// splats), and full 4K per view per iteration is not a useful place to
+/// discover whether the pipeline converges.
+func downsampledRGB(_ frame: IngestedFrame, width: Int, height: Int) -> [Float]? {
+    let sourceWidth = frame.width, sourceHeight = frame.height
+    guard sourceWidth >= width, sourceHeight >= height, width > 0, height > 0 else { return nil }
+    CVPixelBufferLockBaseAddress(frame.pixelBuffer, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(frame.pixelBuffer, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(frame.pixelBuffer) else { return nil }
+    let stride = CVPixelBufferGetBytesPerRow(frame.pixelBuffer)
+    let bytes = base.assumingMemoryBound(to: UInt8.self)
+
+    var out = [Float](repeating: 0, count: width * height * 3)
+    for y in 0..<height {
+        let y0 = y * sourceHeight / height, y1 = max(y0 + 1, (y + 1) * sourceHeight / height)
+        for x in 0..<width {
+            let x0 = x * sourceWidth / width, x1 = max(x0 + 1, (x + 1) * sourceWidth / width)
+            var r = 0.0, g = 0.0, b = 0.0, n = 0.0
+            for sy in y0..<y1 {
+                let row = sy * stride
+                for sx in x0..<x1 {
+                    b += Double(bytes[row + sx * 4 + 0])
+                    g += Double(bytes[row + sx * 4 + 1])
+                    r += Double(bytes[row + sx * 4 + 2])
+                    n += 1
+                }
+            }
+            let o = (y * width + x) * 3
+            out[o] = Float(r / n / 255); out[o + 1] = Float(g / n / 255); out[o + 2] = Float(b / n / 255)
+        }
+    }
+    return out
+}
+
+func runTrain(_ args: [String]) {
+    var inputPath: String?
+    var target = 24
+    var iterations = 200
+    var renderScale = 12
+    var saveDir: String?
+
+    var i = 0
+    while i < args.count {
+        let arg = args[i]
+        func value(for flag: String) -> String {
+            i += 1
+            guard i < args.count else { fail("Missing value for \(flag)", code: 2) }
+            return args[i]
+        }
+        switch arg {
+        case "--target":
+            guard let n = Int(value(for: arg)), n > 0 else { fail("--target needs a positive integer", code: 2) }
+            target = n
+        case "--iterations":
+            guard let n = Int(value(for: arg)), n > 0 else { fail("--iterations needs a positive integer", code: 2) }
+            iterations = n
+        case "--scale":
+            guard let n = Int(value(for: arg)), n > 0 else { fail("--scale needs a positive integer", code: 2) }
+            renderScale = n
+        case "--save": saveDir = value(for: arg)
+        default:
+            if arg.hasPrefix("--") { fail("Unknown flag \(arg)", code: 2) }
+            inputPath = arg
+        }
+        i += 1
+    }
+    guard let inputPath = inputPath else {
+        fail("Usage: splatctl train <input> [--target N] [--iterations N] [--scale N] [--save dir]", code: 2)
+    }
+
+    let source: IngestionSource
+    do { source = try IngestionSource.detect(at: URL(fileURLWithPath: inputPath)) }
+    catch { fail("\(error)") }
+
+    print("=== Train ===")
+    let analyzer = FrameAnalyzerFactory.make()
+    let extractor = FeatureExtractorFactory.make()
+
+    var scores: [FrameScore] = []
+    do {
+        try FrameIngestor.ingest(source) { frame in
+            scores.append(try analyzer.analyze(index: frame.index, timestamp: frame.timestamp,
+                                               pixelBuffer: frame.pixelBuffer))
+            return true
+        }
+    } catch { fail("Analysis failed: \(error)") }
+    let selection = FrameSelector.select(
+        scores: scores, options: FilterOptions(targetFrameCount: target, dedupMinDistance: 0.001))
+    let wanted = Set(selection.selected.map { $0.index })
+
+    var featureSets: [FeatureSet] = []
+    var intrinsicsByFrame: [Int: CameraIntrinsics] = [:]
+    var references: [Int: [Float]] = [:]
+    var frameWidth = 0, frameHeight = 0
+    var renderWidth = 0, renderHeight = 0
+    do {
+        try FrameIngestor.ingest(source) { frame in
+            guard wanted.contains(frame.index) else { return true }
+            featureSets.append(try extractor.extract(index: frame.index, pixelBuffer: frame.pixelBuffer,
+                                                     options: FeatureOptions(maxFeatures: 1500)))
+            frameWidth = frame.width; frameHeight = frame.height
+            renderWidth = max(1, frame.width / renderScale)
+            renderHeight = max(1, frame.height / renderScale)
+            intrinsicsByFrame[frame.index] = CameraIntrinsics.guess(width: frame.width, height: frame.height)
+            references[frame.index] = downsampledRGB(frame, width: renderWidth, height: renderHeight)
+            return true
+        }
+    } catch { fail("Feature extraction failed: \(error)") }
+
+    if let estimate = FocalEstimation.estimate(featureSets: featureSets,
+                                               imageWidth: frameWidth, imageHeight: frameHeight) {
+        for key in intrinsicsByFrame.keys { intrinsicsByFrame[key]?.focalLength = estimate.focalLength }
+    }
+    guard let (reconstruction, report) = StructureFromMotion.reconstruct(
+        featureSets: featureSets, intrinsics: intrinsicsByFrame) else { fail("Reconstruction failed.") }
+    print("Cameras:      \(report.registeredCameras)/\(report.totalCameras), \(report.points) points")
+
+    var cloud = SplatCloud.fromReconstruction(reconstruction)
+    guard cloud.count > 0 else { fail("No splats.") }
+    let extent = SplatOptimizer.sceneExtent(of: cloud)
+    var opts = OptimizerOptions()
+    opts.scaleToScene(extent: extent)
+    let optimizer = SplatOptimizer(splatCount: cloud.count, options: opts)
+    print("Splats:       \(cloud.count) initial, scene extent \(String(format: "%.2f", extent))")
+    print("Resolution:   \(renderWidth) x \(renderHeight) (1/\(renderScale) scale)")
+
+    // Views that both registered AND have a reference image.
+    let views = reconstruction.cameras.keys.sorted().compactMap { frame -> (Int, RegisteredCamera, [Float])? in
+        guard let camera = reconstruction.cameras[frame], let reference = references[frame] else { return nil }
+        var scaled = camera.intrinsics
+        scaled.focalLength /= Double(renderScale)
+        scaled.cx /= Double(renderScale); scaled.cy /= Double(renderScale)
+        return (frame, RegisteredCamera(frameIndex: frame, pose: camera.pose, intrinsics: scaled), reference)
+    }
+    guard !views.isEmpty else { fail("No views with both a pose and an image.") }
+    print("Views:        \(views.count)")
+
+    let background = SIMD3<Float>(repeating: 0.05)
+    var outURL: URL?
+    if let saveDir = saveDir {
+        let url = URL(fileURLWithPath: saveDir, isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        outURL = url
+    }
+
+    let start = Date()
+    var firstLoss = 0.0, lastLoss = 0.0
+    for iteration in 1...iterations {
+        var accumulated = SplatGradients(count: cloud.count)
+        var epochLoss = 0.0
+        for (_, camera, reference) in views {
+            let (loss, g) = SplatBackward.lossAndGradients(
+                cloud: cloud, pose: camera.pose, intrinsics: camera.intrinsics,
+                width: renderWidth, height: renderHeight, reference: reference, background: background)
+            epochLoss += loss
+            accumulated.add(g)
+        }
+        epochLoss /= Double(views.count)
+        if iteration == 1 { firstLoss = epochLoss }
+        lastLoss = epochLoss
+
+        optimizer.apply(gradients: accumulated, to: &cloud)
+
+        // Densify periodically, and only after the fit has settled a little —
+        // densifying against noise in the first iterations just multiplies bad
+        // splats.
+        if iteration % 50 == 0 && iteration >= 50 && iteration < iterations - 20 {
+            let density = optimizer.densifyAndPrune(cloud: &cloud, gradients: accumulated,
+                                                    sceneExtent: extent)
+            print(String(format: "  iter %-5d loss %.5f  (+%d cloned, +%d split, -%d pruned -> %d splats)",
+                         iteration, epochLoss, density.cloned, density.split, density.pruned, density.finalCount))
+        } else if iteration % 25 == 0 || iteration == 1 {
+            print(String(format: "  iter %-5d loss %.5f  (%d splats)", iteration, epochLoss, cloud.count))
+        }
+    }
+
+    print("\n=== Result ===")
+    print(String(format: "Loss:         %.5f -> %.5f (%.0f%% reduction)",
+                 firstLoss, lastLoss, (1 - lastLoss / max(firstLoss, 1e-12)) * 100))
+    print("Splats:       \(cloud.count)")
+    print("Elapsed:      \(String(format: "%.1f", Date().timeIntervalSince(start)))s")
+
+    if let outURL = outURL {
+        for (frame, camera, reference) in views.prefix(3) {
+            let image = SplatRasterizer.render(cloud: cloud, pose: camera.pose, intrinsics: camera.intrinsics,
+                                               width: renderWidth, height: renderHeight, background: background)
+            writeRenderPNG(image, to: outURL.appendingPathComponent(String(format: "trained_%05d.png", frame)))
+            var ref = RenderTarget(width: renderWidth, height: renderHeight)
+            ref.pixels = reference
+            writeRenderPNG(ref, to: outURL.appendingPathComponent(String(format: "reference_%05d.png", frame)))
+        }
+        print("Saved:        renders and references to \(outURL.path)")
     }
 }
 
