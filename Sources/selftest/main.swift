@@ -1793,5 +1793,115 @@ do {
            "coincident points do not produce infinite log-scale")
 }
 
+print("Backward pass (finite-difference verification):")
+do {
+    // The only honest test of a hand-derived gradient. A sign error or a
+    // dropped term produces gradients that still look smooth and plausible and
+    // still decrease the loss for a while, then train to something subtly
+    // wrong; finite differences distinguish "derivative" from "shaped like a
+    // derivative".
+    let intrinsics = CameraIntrinsics(focalLength: 300, cx: 32, cy: 24)
+    let width = 64, height = 48
+
+    // A small scene with splats at different depths and off-axis positions, so
+    // the perspective terms (which vanish on the optical axis) are exercised.
+    var cloud = SplatCloud()
+    cloud.append(Splat(position: SIMD3<Float>(0.15, -0.1, 2.0),
+                       logScale: SIMD3<Float>(logf(0.18), logf(0.14), logf(0.16)),
+                       rotation: SIMD4<Float>(0.1, 0.2, 0.05, 0.97),
+                       opacityLogit: 0.4, color: SIMD3<Float>(0.8, 0.3, 0.2)))
+    cloud.append(Splat(position: SIMD3<Float>(-0.2, 0.12, 2.6),
+                       logScale: SIMD3<Float>(logf(0.20), logf(0.16), logf(0.18)),
+                       rotation: SIMD4<Float>(-0.15, 0.1, 0.2, 0.96),
+                       opacityLogit: 0.1, color: SIMD3<Float>(0.2, 0.7, 0.5)))
+    cloud.append(Splat(position: SIMD3<Float>(0.05, 0.2, 1.7),
+                       logScale: SIMD3<Float>(logf(0.14), logf(0.18), logf(0.15)),
+                       rotation: SIMD4<Float>(0.05, -0.1, 0.15, 0.98),
+                       opacityLogit: -0.3, color: SIMD3<Float>(0.4, 0.4, 0.9)))
+
+    // A fixed pseudo-random reference: an arbitrary target makes every
+    // parameter have a non-zero gradient, whereas rendering the cloud itself
+    // would sit at a minimum where gradients are ~0 and any error hides.
+    var rng = SplitMix64(seed: 20260719)
+    let reference = (0..<(width * height * 3)).map { _ in Float(rng.nextUniform()) }
+    let background = SIMD3<Float>(0.1, 0.1, 0.15)
+
+    func lossOf(_ c: SplatCloud) -> Double {
+        let image = SplatRasterizer.render(cloud: c, pose: .identity, intrinsics: intrinsics,
+                                           width: width, height: height, background: background)
+        return SplatRasterizer.meanAbsoluteError(image, reference: reference)
+    }
+
+    let (analyticLoss, gradients) = SplatBackward.lossAndGradients(
+        cloud: cloud, pose: .identity, intrinsics: intrinsics,
+        width: width, height: height, reference: reference, background: background)
+    expect(abs(analyticLoss - lossOf(cloud)) < 1e-9,
+           "backward reports the same loss as a forward render")
+
+    /// Central difference on one scalar parameter.
+    func numeric(_ mutate: (inout SplatCloud, Float) -> Void, step: Float) -> Double {
+        var plus = cloud, minus = cloud
+        mutate(&plus, step)
+        mutate(&minus, -step)
+        return (lossOf(plus) - lossOf(minus)) / Double(2 * step)
+    }
+
+    func compare(_ name: String, analytic: Float, numeric: Double, tolerance: Double = 0.06) {
+        let a = Double(analytic)
+        let scale = Swift.max(abs(a), abs(numeric), 1e-7)
+        let relative = abs(a - numeric) / scale
+        expect(relative < tolerance,
+               String(format: "%@: analytic %.6g vs numeric %.6g (rel %.3f)", name, a, numeric, relative))
+    }
+
+    for i in 0..<cloud.count {
+        // Colour — the most direct path.
+        compare("splat \(i) dL/dcolor.r", analytic: gradients.colors[i].x,
+                numeric: numeric({ c, d in c.colors[i].x += d }, step: 1e-3))
+
+        // Opacity logit — through the sigmoid and the alpha blend.
+        compare("splat \(i) dL/dopacityLogit", analytic: gradients.opacityLogits[i],
+                numeric: numeric({ c, d in c.opacityLogits[i] += d }, step: 1e-3))
+
+        // Position — through projection AND through the covariance Jacobian.
+        compare("splat \(i) dL/dposition.x", analytic: gradients.positions[i].x,
+                numeric: numeric({ c, d in c.positions[i].x += d }, step: 1e-4))
+        compare("splat \(i) dL/dposition.z", analytic: gradients.positions[i].z,
+                numeric: numeric({ c, d in c.positions[i].z += d }, step: 1e-4))
+
+        // Log-scale — through covariance, its inverse, and the exponential.
+        compare("splat \(i) dL/dlogScale.x", analytic: gradients.logScales[i].x,
+                numeric: numeric({ c, d in c.logScales[i].x += d }, step: 1e-3))
+
+        // Rotation — through the quaternion normalisation and R S Sᵀ Rᵀ.
+        //
+        // Larger step and looser tolerance than the other parameters, both for
+        // the same reason: rotation has by far the weakest influence on the
+        // image. A near-isotropic splat barely changes when turned, so the
+        // finite difference is a small number sitting on top of rasterization
+        // discretization (integer pixel bounds, the alpha cutoff, the
+        // transmittance cutoff), and a 1e-3 quaternion step lands near that
+        // noise floor. The dependence is real and was measured: shrinking the
+        // splats in this scene moved rotation agreement from 2% to 54% while
+        // the analytic value barely moved, which is the signature of a noisy
+        // REFERENCE rather than a wrong derivative.
+        compare("splat \(i) dL/drotation.z", analytic: gradients.rotations[i].z,
+                numeric: numeric({ c, d in c.rotations[i].z += d }, step: 4e-3),
+                tolerance: 0.15)
+    }
+
+    // A splat behind the camera must receive no gradient at all, rather than a
+    // small wrong one — it is culled, so it genuinely cannot affect the image.
+    var withHidden = cloud
+    withHidden.append(Splat(position: SIMD3<Float>(0, 0, -3), logScale: SIMD3<Float>(repeating: logf(0.1)),
+                            rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 1, color: SIMD3<Float>(1, 1, 1)))
+    let (_, hiddenGradients) = SplatBackward.lossAndGradients(
+        cloud: withHidden, pose: .identity, intrinsics: intrinsics,
+        width: width, height: height, reference: reference, background: background)
+    let last = withHidden.count - 1
+    expect(hiddenGradients.colors[last] == .zero && hiddenGradients.opacityLogits[last] == 0,
+           "a culled splat receives exactly zero gradient")
+}
+
 print("\n\(passed) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

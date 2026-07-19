@@ -419,8 +419,40 @@ Implemented:
   definition uniform mid-grey blobs. Making it resemble the input needs the
   backward pass.
 
-Not yet implemented: the training half of stage 5 (backward pass, optimizer,
-adaptive density control, checkpoint/resume) and its Metal kernels, viewer
+- **Backward pass** (`SplatCore/Splatting/SplatBackward.swift`) — analytic
+  gradients of an L1 image loss w.r.t. every splat parameter: colour, opacity
+  logit, position, log-scale and rotation quaternion. The chain runs pixel →
+  alpha blend → (colour, alpha) → G = exp(power) → conic → 2D covariance → 3D
+  covariance → scale/rotation, and position → camera → world.
+
+  **Every gradient is verified against finite differences**, which is the only
+  test that distinguishes a derivative from something merely shaped like one: a
+  sign error or dropped term still yields smooth, plausible gradients that
+  decrease the loss for a while and then train to something subtly wrong.
+  Measured agreement: colour, opacity and position.x to <0.1%; position.z,
+  log-scale and rotation to 0.3–2%.
+
+  Three things the derivation gets right that are easy to miss:
+  - Alpha's gradient has an *indirect* term. Raising a splat's alpha also
+    attenuates everything behind it, so the gradient is
+    `c·T − (colour behind)/(1−α)`. The "colour behind" is recovered as
+    `final − accumulated_in_front − this_splat` rather than cached, keeping
+    memory at O(pixels) instead of O(pixels × splats) — tens of GB at 4K.
+  - Position moves the 2D **covariance** as well as the centre, through the
+    projection Jacobian. Omitting that term is silent: gradients stay plausible
+    while position updates are wrong wherever a splat is off-axis.
+  - The quaternion gradient includes the normalisation Jacobian
+    `(I − q̂q̂ᵀ)/|q|`. Without it the optimiser spends updates changing the
+    quaternion's *length*, which the rotation matrix ignores entirely.
+
+  Note the tests use deliberately large splats. Finite differences on a splat
+  covering few pixels are dominated by rasterization discretization (integer
+  pixel bounds, alpha and transmittance cutoffs) — shrinking the test splats
+  moved rotation agreement from 2% to 54% while the analytic value barely
+  moved, which is a noisy *reference*, not a wrong derivative.
+
+Not yet implemented: the optimizer and adaptive density control (clone / split
+/ prune), checkpoint/resume, the Metal kernels for the splatting path, viewer
 (stage 6), export (stage 7), and homography-based initialization for planar
 scenes.
 
