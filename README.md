@@ -4,7 +4,7 @@ Native macOS app that converts a photo series or video into a 3D Gaussian
 Splat. Universal binary (arm64 + x86_64), deployment target **macOS 11.0
 (Big Sur)**, GPU compute via raw Metal — no CUDA anywhere.
 
-## Status: stages 1 (ingestion), 2 (filtering), 3 (SfM), 4 (probe), 5 (training)
+## Status: stages 1 (ingestion), 2 (filtering), 3 (SfM), 4 (probe), 5 (training), 6 (viewer)
 
 Implemented:
 - **Ingestion** (`SplatCore/Ingestion/`) — photo folders (ImageIO: EXIF
@@ -572,9 +572,22 @@ Implemented:
   where it left off. CLI: `splatctl train ... [--checkpoint file] [--resume
   file] [--cpu]`.
 
-**Stage 5 is complete.** Not yet implemented: viewer (stage 6), export (stage
-7), spherical-harmonic view-dependent colour, and homography-based
-initialization for planar scenes.
+- **Interactive orbit viewer** (`App/Sources/SplatOrbitView.swift`) — completes
+  stage 6. An `NSView` (wrapped for SwiftUI) that renders the loaded cloud from
+  the orbit camera and turns drag → orbit, scroll → zoom, ⌥-drag → pan. It
+  reuses the verified `MetalSplatRasterizer` (CPU fallback) and draws the
+  `RenderTarget` as a `CGImage` rather than standing up an MTKView +
+  drawable-writing kernel — the rasterizer is already checked to float
+  round-off, and a preview does not need the last few ms a direct-drawable path
+  would save. Renders at a capped resolution during a gesture and a higher one
+  at rest, so the legacy CPU tier stays usable. The app now opens a dropped
+  `.splt` straight into the viewer. **Verified by driving the running app**:
+  loaded a 2,347-splat scene, orbited and zoomed, and the trained plant/tray
+  render stayed coherent from viewpoints never trained on.
+
+**Stages 1–6 are complete.** Not yet implemented: export (stage 7 — `.ply`,
+`.splat`/`.ksplat`, USDZ, turntable/fly-through video), spherical-harmonic
+view-dependent colour, and homography-based initialization for planar scenes.
 
 ## Tier architecture
 

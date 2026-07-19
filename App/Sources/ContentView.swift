@@ -10,11 +10,31 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 16) {
             tierSection
             Divider()
-            dropZone
-            statusSection
+            if let cloud = model.loadedCloud {
+                viewerSection(cloud: cloud)
+            } else {
+                dropZone
+                statusSection
+            }
             Spacer()
         }
         .padding(20)
+    }
+
+    private func viewerSection(cloud: SplatCloud) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Viewing \(cloud.count) splats")
+                    .font(.callout).bold()
+                Spacer()
+                Button("Close") { model.closeViewer() }
+            }
+            SplatViewerRepresentable(cloud: cloud)
+                .frame(minWidth: 480, minHeight: 360)
+                .cornerRadius(8)
+            Text("Drag to orbit · scroll to zoom · ⌥-drag to pan")
+                .font(.caption).foregroundColor(.secondary)
+        }
     }
 
     private var tierSection: some View {
@@ -58,7 +78,7 @@ struct ContentView: View {
                         .frame(maxHeight: 180)
                         .cornerRadius(6)
                 }
-                Text("Drop a photo folder or a video here")
+                Text("Drop a photo folder, a video, or a .splt scene here")
                     .foregroundColor(.secondary)
             }
             .padding(12)
@@ -74,7 +94,15 @@ struct ContentView: View {
                     url = item as? URL
                 }
                 if let url = url {
-                    DispatchQueue.main.async { model.ingest(url: url) }
+                    DispatchQueue.main.async {
+                        // A trained scene opens straight into the viewer;
+                        // anything else is treated as capture input.
+                        if url.pathExtension.lowercased() == "splt" {
+                            model.loadScene(url: url)
+                        } else {
+                            model.ingest(url: url)
+                        }
+                    }
                 }
             }
             return true

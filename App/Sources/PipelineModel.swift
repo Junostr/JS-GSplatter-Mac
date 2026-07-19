@@ -23,7 +23,29 @@ final class PipelineModel: ObservableObject {
     @Published private(set) var ingestState: IngestState = .idle
     @Published private(set) var previewImage: NSImage?
 
+    /// A trained splat scene loaded for interactive viewing (stage 6).
+    @Published private(set) var loadedCloud: SplatCloud?
+
     private let workQueue = DispatchQueue(label: "splat.ingest", qos: .userInitiated)
+
+    /// Load a `.splt` checkpoint and hand it to the viewer. Decode runs off the
+    /// main thread — a mature scene is hundreds of thousands of splats — and
+    /// only the published assignment hops back.
+    func loadScene(url: URL) {
+        workQueue.async { [weak self] in
+            guard let self = self else { return }
+            do {
+                let (cloud, _) = try SplatCheckpoint.read(from: url)
+                DispatchQueue.main.async { self.loadedCloud = cloud }
+            } catch {
+                DispatchQueue.main.async { self.ingestState = .failed("Could not open scene: \(error)") }
+            }
+        }
+    }
+
+    func closeViewer() {
+        loadedCloud = nil
+    }
 
     init() {
         let probe = HardwareProbe.run()
