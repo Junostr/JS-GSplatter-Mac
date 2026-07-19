@@ -12,13 +12,48 @@ struct ContentView: View {
             Divider()
             if let cloud = model.loadedCloud {
                 viewerSection(cloud: cloud)
+            } else if case .running = model.processState {
+                processingSection
             } else {
                 dropZone
+                if case .failed(let message) = model.processState {
+                    Text(message).font(.callout).foregroundColor(.red)
+                }
                 statusSection
             }
             Spacer()
         }
         .padding(20)
+    }
+
+    @ViewBuilder
+    private var processingSection: some View {
+        if case .running(let status, let fraction) = model.processState {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack {
+                    Text("Building your scene")
+                        .font(.headline)
+                    Spacer()
+                    Button("Cancel") { model.cancelProcessing() }
+                }
+                if let preview = model.trainingPreview {
+                    Image(nsImage: preview)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(maxHeight: 300)
+                        .cornerRadius(8)
+                } else {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.secondary.opacity(0.1))
+                        .frame(height: 200)
+                        .overlay(ProgressView())
+                }
+                ProgressView(value: fraction)
+                Text(status)
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+            }
+        }
     }
 
     private func viewerSection(cloud: SplatCloud) -> some View {
@@ -96,11 +131,11 @@ struct ContentView: View {
                 if let url = url {
                     DispatchQueue.main.async {
                         // A trained scene opens straight into the viewer;
-                        // anything else is treated as capture input.
+                        // a capture runs the whole pipeline and lands there too.
                         if url.pathExtension.lowercased() == "splt" {
                             model.loadScene(url: url)
                         } else {
-                            model.ingest(url: url)
+                            model.process(url: url)
                         }
                     }
                 }

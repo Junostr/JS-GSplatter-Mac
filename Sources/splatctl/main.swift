@@ -488,52 +488,30 @@ func runTrain(_ args: [String]) {
     catch { fail("\(error)") }
 
     print("=== Train ===")
-    let analyzer = FrameAnalyzerFactory.make()
-    let extractor = FeatureExtractorFactory.make()
 
-    var scores: [FrameScore] = []
+    // The whole ingest -> filter -> features -> focal -> SfM prep is the shared
+    // ScenePipeline driver, so the CLI and the app run identical code.
+    let prepared: PreparedScene
     do {
-        try FrameIngestor.ingest(source) { frame in
-            scores.append(try analyzer.analyze(index: frame.index, timestamp: frame.timestamp,
-                                               pixelBuffer: frame.pixelBuffer))
-            return true
-        }
-    } catch { fail("Analysis failed: \(error)") }
-    let selection = FrameSelector.select(
-        scores: scores, options: FilterOptions(targetFrameCount: target, dedupMinDistance: 0.001))
-    let wanted = Set(selection.selected.map { $0.index })
+        prepared = try ScenePipeline.prepare(
+            source: source,
+            options: ScenePipelineOptions(targetFrames: target, renderScale: renderScale),
+            forceCPU: forceCPU,
+            progress: { phase in
+                switch phase {
+                case .reconstructing: print("Reconstructing…")
+                case .preparingSplats(let n): print("Splats:       \(n) from the sparse cloud")
+                default: break
+                }
+            })
+    } catch { fail("\(error)") }
 
-    var featureSets: [FeatureSet] = []
-    var intrinsicsByFrame: [Int: CameraIntrinsics] = [:]
-    var references: [Int: [Float]] = [:]
-    var frameWidth = 0, frameHeight = 0
-    var renderWidth = 0, renderHeight = 0
-    do {
-        try FrameIngestor.ingest(source) { frame in
-            guard wanted.contains(frame.index) else { return true }
-            featureSets.append(try extractor.extract(index: frame.index, pixelBuffer: frame.pixelBuffer,
-                                                     options: FeatureOptions(maxFeatures: 1500)))
-            frameWidth = frame.width; frameHeight = frame.height
-            renderWidth = max(1, frame.width / renderScale)
-            renderHeight = max(1, frame.height / renderScale)
-            intrinsicsByFrame[frame.index] = CameraIntrinsics.guess(width: frame.width, height: frame.height)
-            references[frame.index] = downsampledRGB(frame, width: renderWidth, height: renderHeight)
-            return true
-        }
-    } catch { fail("Feature extraction failed: \(error)") }
+    print("Cameras:      \(prepared.registeredCameras)/\(prepared.totalCameras)")
+    let trainingViews = prepared.views
 
-    if let estimate = FocalEstimation.estimate(featureSets: featureSets,
-                                               imageWidth: frameWidth, imageHeight: frameHeight) {
-        for key in intrinsicsByFrame.keys { intrinsicsByFrame[key]?.focalLength = estimate.focalLength }
-    }
-    guard let (reconstruction, report) = StructureFromMotion.reconstruct(
-        featureSets: featureSets, intrinsics: intrinsicsByFrame) else { fail("Reconstruction failed.") }
-    print("Cameras:      \(report.registeredCameras)/\(report.totalCameras), \(report.points) points")
-
-    var cloud = SplatCloud.fromReconstruction(reconstruction)
-    guard cloud.count > 0 else { fail("No splats.") }
-
-    // Resume from a checkpoint if one was given and exists.
+    var cloud = prepared.initialCloud
+    // Resume from a checkpoint if one was given and exists; the reconstruction's
+    // views still supply the poses.
     var startIteration = 0
     if let resumePath = resumePath, FileManager.default.fileExists(atPath: resumePath) {
         do {
@@ -542,20 +520,9 @@ func runTrain(_ args: [String]) {
             print("Resumed:      \(cloud.count) splats from iteration \(startIteration)")
         } catch { fail("Could not read checkpoint: \(error)") }
     }
-
     let extent = SplatOptimizer.sceneExtent(of: cloud)
     print("Splats:       \(cloud.count) initial, scene extent \(String(format: "%.2f", extent))")
-    print("Resolution:   \(renderWidth) x \(renderHeight) (1/\(renderScale) scale)")
-
-    let trainingViews = reconstruction.cameras.keys.sorted().compactMap { frame -> TrainingView? in
-        guard let camera = reconstruction.cameras[frame], let reference = references[frame] else { return nil }
-        var scaled = camera.intrinsics
-        scaled.focalLength /= Double(renderScale)
-        scaled.cx /= Double(renderScale); scaled.cy /= Double(renderScale)
-        return TrainingView(frameIndex: frame, pose: camera.pose, intrinsics: scaled,
-                            reference: reference, width: renderWidth, height: renderHeight)
-    }
-    guard !trainingViews.isEmpty else { fail("No views with both a pose and an image.") }
+    print("Resolution:   \(prepared.renderWidth) x \(prepared.renderHeight) (1/\(renderScale) scale)")
     print("Views:        \(trainingViews.count)")
 
     var trainerOptions = TrainerOptions()
@@ -608,7 +575,7 @@ func runTrain(_ args: [String]) {
         for view in trainingViews.prefix(3) {
             let image = trainer.render(view: view)
             writeRenderPNG(image, to: outURL.appendingPathComponent(String(format: "trained_%05d.png", view.frameIndex)))
-            var ref = RenderTarget(width: renderWidth, height: renderHeight)
+            var ref = RenderTarget(width: prepared.renderWidth, height: prepared.renderHeight)
             ref.pixels = view.reference
             writeRenderPNG(ref, to: outURL.appendingPathComponent(String(format: "reference_%05d.png", view.frameIndex)))
         }

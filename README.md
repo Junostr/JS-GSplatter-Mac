@@ -53,10 +53,14 @@ Implemented:
   promise that can hold across Nvidia/AMD/Apple GPUs. Verified identical on
   two different GPUs (M1 Pro and CI's paravirtual device).
 - **App shell** (`App/`) — SwiftUI drag-and-drop UI (macOS 11-safe API
-  surface only): shows the tier decision with reasons and a force-baseline
-  toggle, accepts a dropped photo folder or video, runs ingestion off-main
-  with live progress and a first-frame preview. Same sources build via the
-  Xcode project (dev) and `Scripts/build-app.sh` (distribution).
+  surface only): shows the tier decision, and — the whole pipeline in the app —
+  **drop a video and it analyzes, reconstructs, trains (with a live preview of
+  the scene emerging), and lands in the interactive viewer**, all off-main with
+  a progress bar and a cancel button; drop a `.splt` to open a finished scene
+  straight into the viewer. The processing is the shared `ScenePipeline` driver,
+  the same code the CLI runs, so the app and `splatctl` cannot drift. Verified
+  by driving the running app end to end on the real capture. Same sources build
+  via the Xcode project (dev) and `Scripts/build-app.sh` (distribution).
 - **Hardware/OS capability probe** (`SplatCore/Capabilities/HardwareProbe.swift`)
   — GPU vendor/working set via Metal, CPU architecture, macOS version,
   Rosetta 2 detection.
