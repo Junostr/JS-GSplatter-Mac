@@ -44,8 +44,10 @@ case "render":
     runRender(args)
 case "train":
     runTrain(args)
+case "view":
+    runView(args)
 default:
-    fail("Unknown command '\(command)'. Commands: probe, ingest, filter, sfm, features, render, train", code: 2)
+    fail("Unknown command '\(command)'. Commands: probe, ingest, filter, sfm, features, render, train, view", code: 2)
 }
 
 // MARK: - probe
@@ -313,6 +315,92 @@ func runFilter(_ args: [String]) {
             fail("Saving selected frames failed: \(error)")
         }
     }
+}
+
+// MARK: - view (stage 6 turntable renderer)
+
+/// Render an orbit turntable of a trained checkpoint. Proves the viewer's
+/// render path from NOVEL viewpoints — not just the training cameras — and is
+/// the same orbit path stage 7 will encode to a fly-through video.
+func runView(_ args: [String]) {
+    var checkpointPath: String?
+    var saveDir: String?
+    var frames = 24
+    var width = 480, height = 360
+    var arcDegrees = 360.0
+    var elevationDegrees = 15.0
+
+    var i = 0
+    while i < args.count {
+        let arg = args[i]
+        func value(for flag: String) -> String {
+            i += 1
+            guard i < args.count else { fail("Missing value for \(flag)", code: 2) }
+            return args[i]
+        }
+        switch arg {
+        case "--save": saveDir = value(for: arg)
+        case "--frames":
+            guard let n = Int(value(for: arg)), n > 0 else { fail("--frames needs a positive integer", code: 2) }
+            frames = n
+        case "--width":
+            guard let n = Int(value(for: arg)), n > 0 else { fail("--width needs a positive integer", code: 2) }
+            width = n
+        case "--height":
+            guard let n = Int(value(for: arg)), n > 0 else { fail("--height needs a positive integer", code: 2) }
+            height = n
+        case "--arc":
+            guard let v = Double(value(for: arg)) else { fail("--arc needs a number", code: 2) }
+            arcDegrees = v
+        case "--elevation":
+            guard let v = Double(value(for: arg)) else { fail("--elevation needs a number", code: 2) }
+            elevationDegrees = v
+        default:
+            if arg.hasPrefix("--") { fail("Unknown flag \(arg)", code: 2) }
+            checkpointPath = arg
+        }
+        i += 1
+    }
+    guard let checkpointPath = checkpointPath else {
+        fail("Usage: splatctl view <checkpoint.splt> --save <dir> [--frames N] [--width N] [--height N] [--arc deg] [--elevation deg]", code: 2)
+    }
+    guard let saveDir = saveDir else { fail("--save <dir> is required for view", code: 2) }
+
+    let cloud: SplatCloud
+    do { (cloud, _) = try SplatCheckpoint.read(from: URL(fileURLWithPath: checkpointPath)) }
+    catch { fail("Could not read checkpoint: \(error)") }
+    guard cloud.count > 0 else { fail("Checkpoint has no splats.") }
+
+    let outURL = URL(fileURLWithPath: saveDir, isDirectory: true)
+    try? FileManager.default.createDirectory(at: outURL, withIntermediateDirectories: true)
+
+    print("=== View (turntable) ===")
+    print("Splats:       \(cloud.count)")
+    let base = OrbitCamera.framing(cloud: cloud)
+    let rasterizer = try? MetalSplatRasterizer()
+    print("Renderer:     \(rasterizer?.descriptionForLog ?? "CPU rasterizer (reference)")")
+    print("Frames:       \(frames) over \(Int(arcDegrees))° at \(Int(elevationDegrees))° elevation")
+
+    let background = SIMD3<Float>(repeating: 0.05)
+    let start = Date()
+    for frame in 0..<frames {
+        var camera = base
+        camera.elevation = min(max(elevationDegrees * .pi / 180, -OrbitCamera.maxElevation), OrbitCamera.maxElevation)
+        camera.azimuth = (arcDegrees * .pi / 180) * Double(frame) / Double(frames)
+        let intrinsics = camera.intrinsics(width: width, height: height)
+        let image: RenderTarget
+        if let rasterizer = rasterizer,
+           let gpu = try? rasterizer.render(cloud: cloud, pose: camera.pose, intrinsics: intrinsics,
+                                            width: width, height: height, background: background) {
+            image = gpu
+        } else {
+            image = SplatRasterizer.render(cloud: cloud, pose: camera.pose, intrinsics: intrinsics,
+                                           width: width, height: height, background: background)
+        }
+        writeRenderPNG(image, to: outURL.appendingPathComponent(String(format: "turntable_%03d.png", frame)))
+    }
+    print("Rendered:     \(frames) views in \(String(format: "%.1f", Date().timeIntervalSince(start)))s")
+    print("Saved to:     \(outURL.path)")
 }
 
 // MARK: - train (stage 5 end to end)

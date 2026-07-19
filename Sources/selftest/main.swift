@@ -2355,5 +2355,106 @@ do {
     expect(fromDisk.count == trainer.cloud.count, "checkpoint survives a disk round-trip")
 }
 
+print("Orbit camera (convention pinned against known geometry):")
+do {
+    let target = SIMD3<Double>(1, 2, 3)
+    let camera = OrbitCamera(target: target, distance: 5, azimuth: 0, elevation: 0)
+    let width = 400, height = 300
+    let intrinsics = camera.intrinsics(width: width, height: height)
+
+    // The pose must be a PROPER rotation. A reflection here is the silent
+    // mirror bug the whole project has been bitten by twice.
+    let R = camera.pose.rotation
+    let det = LinearAlgebra.determinant3(R)
+    expect(abs(det - 1) < 1e-9, "orbit pose is a proper rotation, det +1 (got \(det))")
+    let rrt = LinearAlgebra.matMul3(R, LinearAlgebra.transpose3(R))
+    let offDiag = [rrt[1], rrt[2], rrt[5]].map { abs($0) }.max() ?? 1
+    expect(offDiag < 1e-9 && abs(rrt[0] - 1) < 1e-9, "orbit pose rotation is orthonormal")
+
+    // The target projects to the principal point.
+    if let projected = camera.pose.project(target, intrinsics: intrinsics) {
+        expect(abs(projected.x - Double(width) / 2) < 1e-6 && abs(projected.y - Double(height) / 2) < 1e-6,
+               "the target lands at the image centre (got \(projected))")
+    } else { expect(false, "target projects in front of the camera") }
+
+    // A point ABOVE the target in world (+Y) must appear in the UPPER half of
+    // the image (smaller pixel y), not the lower — this is the exact test that
+    // distinguishes a correct look-at from an upside-down one.
+    if let above = camera.pose.project(target + SIMD3<Double>(0, 1, 0), intrinsics: intrinsics) {
+        expect(above.y < Double(height) / 2, "a point above the target appears in the upper half (y \(above.y))")
+    } else { expect(false, "the point above the target is visible") }
+
+    // Azimuth 0 places the eye on the +Z side of the target.
+    let eye = camera.eye
+    expect(eye.z > target.z && abs(eye.x - target.x) < 1e-6,
+           "azimuth 0 puts the eye on +Z of the target (eye \(eye))")
+
+    // Orbiting azimuth by 90 degrees swings the eye onto the +X side.
+    var orbited = camera
+    orbited.orbit(deltaAzimuth: .pi / 2, deltaElevation: 0)
+    expect(orbited.eye.x > target.x && abs(orbited.eye.z - target.z) < 1e-6,
+           "azimuth +90 deg swings the eye to +X (eye \(orbited.eye))")
+
+    // Positive elevation raises the eye above the target.
+    var raised = camera
+    raised.orbit(deltaAzimuth: 0, deltaElevation: 0.5)
+    expect(raised.eye.y > target.y, "positive elevation raises the eye (y \(raised.eye.y))")
+
+    // Elevation is clamped away from the pole.
+    var extreme = camera
+    extreme.orbit(deltaAzimuth: 0, deltaElevation: 10)
+    expect(extreme.elevation < .pi / 2 && extreme.elevation > 0, "elevation is clamped below the pole")
+    let extremeDet = LinearAlgebra.determinant3(extreme.pose.rotation)
+    expect(abs(extremeDet - 1) < 1e-6, "pose stays valid at extreme elevation (det \(extremeDet))")
+
+    // Zoom is multiplicative and cannot cross zero.
+    var zoomed = camera
+    zoomed.zoom(factor: 0.5)
+    expect(abs(zoomed.distance - 2.5) < 1e-9, "zoom halves the distance (got \(zoomed.distance))")
+    zoomed.zoom(factor: 0)
+    expect(zoomed.distance > 0, "zoom cannot reach zero distance")
+}
+
+print("Orbit camera framing and apparent size:")
+do {
+    // A cloud spread about a known centre must be framed on that centre.
+    var rng = SplitMix64(seed: 6006)
+    var points: [SIMD3<Double>] = []
+    let centre = SIMD3<Double>(5, -3, 10)
+    for _ in 0..<200 {
+        points.append(centre + SIMD3<Double>(Double(rng.nextUniform() - 0.5) * 4,
+                                             Double(rng.nextUniform() - 0.5) * 4,
+                                             Double(rng.nextUniform() - 0.5) * 4))
+    }
+    let camera = OrbitCamera.framing(points: points)
+    let centroidError = LinearAlgebra.length(camera.target - centre)
+    expect(centroidError < 1.0, "framing targets the cloud centroid (error \(centroidError))")
+
+    // Every point projects inside the frame from the framing view — the whole
+    // scene fits, which is what "frame it" has to mean.
+    let width = 320, height = 240
+    let intrinsics = camera.intrinsics(width: width, height: height)
+    let inside = points.filter { p in
+        guard let pixel = camera.pose.project(p, intrinsics: intrinsics) else { return false }
+        return pixel.x >= -20 && pixel.x < Double(width) + 20 && pixel.y >= -20 && pixel.y < Double(height) + 20
+    }.count
+    expect(Double(inside) / Double(points.count) > 0.98,
+           "the framed scene fits the viewport (\(inside)/\(points.count) inside)")
+
+    // Doubling distance halves apparent size. Two points a fixed world distance
+    // apart should span half as many pixels from twice as far.
+    let a = centre + SIMD3<Double>(1, 0, 0), b = centre - SIMD3<Double>(1, 0, 0)
+    var near = OrbitCamera(target: centre, distance: 6, azimuth: 0, elevation: 0)
+    var far = near; far.distance = 12
+    func span(_ cam: OrbitCamera) -> Double {
+        let k = cam.intrinsics(width: width, height: height)
+        guard let pa = cam.pose.project(a, intrinsics: k), let pb = cam.pose.project(b, intrinsics: k) else { return 0 }
+        return abs(pa.x - pb.x)
+    }
+    let ratio = span(near) / Swift.max(span(far), 1e-9)
+    expect(abs(ratio - 2) < 0.05, "doubling distance halves apparent size (ratio \(ratio))")
+    _ = (near, far)
+}
+
 print("\n\(passed) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)
