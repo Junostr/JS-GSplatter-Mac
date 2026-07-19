@@ -2083,5 +2083,95 @@ do {
     expect(doomed.count >= 1, "pruning refuses to empty the scene")
 }
 
+print("Metal splat rasterizer (parity with the CPU reference):")
+do {
+    guard let metal = try? MetalSplatRasterizer() else {
+        print("  --  (no Metal device — GPU rasterizer tests skipped, CPU still verified)")
+        print("\n\(passed) passed, \(failures) failed")
+        exit(failures == 0 ? 0 : 1)
+    }
+    let intrinsics = CameraIntrinsics(focalLength: 320, cx: 80, cy: 60)
+    let width = 160, height = 120
+    let background = SIMD3<Float>(0.06, 0.07, 0.1)
+
+    // A scene with overlap at several depths, so the blend order and the
+    // transmittance chain are genuinely exercised rather than a single splat
+    // landing on a blank canvas.
+    var rng = SplitMix64(seed: 4711)
+    var cloud = SplatCloud()
+    for _ in 0..<220 {
+        cloud.append(Splat(
+            position: SIMD3<Float>((rng.nextUniform() - 0.5) * 1.6,
+                                   (rng.nextUniform() - 0.5) * 1.2,
+                                   1.5 + rng.nextUniform() * 2.5),
+            logScale: SIMD3<Float>(repeating: logf(0.03 + rng.nextUniform() * 0.06)),
+            rotation: SplatMath.normalizeQuaternion(SIMD4<Float>(
+                rng.nextUniform() - 0.5, rng.nextUniform() - 0.5,
+                rng.nextUniform() - 0.5, rng.nextUniform() + 0.5)),
+            opacityLogit: -1 + rng.nextUniform() * 4,
+            color: SIMD3<Float>(rng.nextUniform(), rng.nextUniform(), rng.nextUniform())))
+    }
+
+    let cpu = SplatRasterizer.render(cloud: cloud, pose: .identity, intrinsics: intrinsics,
+                                     width: width, height: height, background: background)
+    guard let gpu = try? metal.render(cloud: cloud, pose: .identity, intrinsics: intrinsics,
+                                      width: width, height: height, background: background) else {
+        expect(false, "Metal rasterizer produced a render")
+        print("\n\(passed) passed, \(failures) failed")
+        exit(1)
+    }
+
+    let maxDiff = zip(cpu.pixels, gpu.pixels).map { abs($0 - $1) }.max() ?? 1
+    let meanDiff = zip(cpu.pixels, gpu.pixels).map { Double(abs($0 - $1)) }
+        .reduce(0, +) / Double(cpu.pixels.count)
+    print(String(format: "      %d splats, %dx%d: max diff %.2e, mean diff %.2e",
+                 cloud.count, width, height, maxDiff, meanDiff))
+    // Both tiers do the same arithmetic in the same order, but they are
+    // different compilers and different hardware, so exact equality is not a
+    // promise that can hold across GPU vendors. 1e-4 is far below the 1/255
+    // an 8-bit output can express.
+    expect(maxDiff < 1e-4, "GPU matches the CPU reference per pixel (max diff \(maxDiff))")
+    let maxTrans = zip(cpu.transmittance, gpu.transmittance).map { abs($0 - $1) }.max() ?? 1
+    expect(maxTrans < 1e-4, "GPU matches CPU transmittance (max diff \(maxTrans))")
+
+    // Empty scene: background only, on both tiers.
+    let emptyCPU = SplatRasterizer.render(cloud: SplatCloud(), pose: .identity, intrinsics: intrinsics,
+                                          width: width, height: height, background: background)
+    if let emptyGPU = try? metal.render(cloud: SplatCloud(), pose: .identity, intrinsics: intrinsics,
+                                        width: width, height: height, background: background) {
+        let diff = zip(emptyCPU.pixels, emptyGPU.pixels).map { abs($0 - $1) }.max() ?? 1
+        expect(diff < 1e-6, "GPU renders an empty scene identically (diff \(diff))")
+    } else {
+        expect(false, "GPU handled an empty scene")
+    }
+
+    // A size that is not a whole number of tiles, to exercise the in-kernel
+    // bounds check that stands in for non-uniform dispatch.
+    let oddWidth = 101, oddHeight = 67
+    let oddCPU = SplatRasterizer.render(cloud: cloud, pose: .identity, intrinsics: intrinsics,
+                                        width: oddWidth, height: oddHeight, background: background)
+    if let oddGPU = try? metal.render(cloud: cloud, pose: .identity, intrinsics: intrinsics,
+                                      width: oddWidth, height: oddHeight, background: background) {
+        let diff = zip(oddCPU.pixels, oddGPU.pixels).map { abs($0 - $1) }.max() ?? 1
+        expect(diff < 1e-4, "GPU handles non-tile-aligned sizes (\(oddWidth)x\(oddHeight), diff \(diff))")
+    } else {
+        expect(false, "GPU handled a non-tile-aligned size")
+    }
+
+    // Speed, at a size where the CPU path is genuinely the bottleneck.
+    let bigW = 640, bigH = 480
+    let cpuStart = Date()
+    _ = SplatRasterizer.render(cloud: cloud, pose: .identity, intrinsics: intrinsics,
+                               width: bigW, height: bigH, background: background)
+    let cpuTime = Date().timeIntervalSince(cpuStart)
+    let gpuStart = Date()
+    _ = try? metal.render(cloud: cloud, pose: .identity, intrinsics: intrinsics,
+                          width: bigW, height: bigH, background: background)
+    let gpuTime = Date().timeIntervalSince(gpuStart)
+    print(String(format: "      %dx%d: CPU %.1f ms, GPU %.1f ms (%.1fx)",
+                 bigW, bigH, cpuTime * 1000, gpuTime * 1000, cpuTime / Swift.max(gpuTime, 1e-9)))
+    expect(gpuTime < cpuTime, "GPU is faster than the CPU reference")
+}
+
 print("\n\(passed) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

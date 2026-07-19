@@ -504,9 +504,34 @@ Implemented:
   percentile is invariant to loss normalisation where an absolute threshold is
   not. After the fix: +55 cloned / +43 split on the first pass.
 
-Not yet implemented: checkpoint/resume, the Metal kernels for the splatting
-path, viewer (stage 6), export (stage 7), and homography-based initialization
-for planar scenes.
+- **Metal forward rasterizer** (`MetalSplatRasterizer`) — the baseline-tier GPU
+  path for splatting. **17× faster than the CPU reference** (125.8 ms → 7.3 ms
+  at 640×480 with 220 splats) and matching it to **2.4e-07** per pixel, which
+  is float round-off.
+
+  Work is split by what each processor is good at: the **CPU** projects, depth
+  sorts and assigns splats to tiles — O(splats), a few thousand items — and the
+  **GPU** blends pixels against their tile's list, which is O(pixels ×
+  splats-per-tile) and the part that actually costs.
+
+  The reference CUDA implementation of 3DGS instead sorts splats into tiles *on
+  the GPU* with a radix sort. That is deliberately **not** copied here: a GPU
+  sort needs heavy atomics or multi-pass scan machinery, and the baseline must
+  run on a GeForce GT 750M (`GPUFamilyMac1`) with limited atomics and no
+  non-uniform threadgroup dispatch. Sorting was never the bottleneck, so moving
+  it to the CPU costs almost nothing and removes that whole compatibility class.
+  (No CUDA anywhere — every tier runs the same hand-written MSL.)
+
+  Getting parity required one real fix. Tile assignment is a *superset* of
+  per-splat coverage, so the GPU was blending splats at pixels inside the tile
+  but outside the splat's bounding box — and beyond 3σ a high-opacity splat
+  still clears the 1/255 alpha floor, so those were real contributions, not
+  rounding. Measured divergence 5.3e-3 before the kernel applied the same
+  bounds test as the reference.
+
+Not yet implemented: the Metal backward kernel, checkpoint/resume, viewer
+(stage 6), export (stage 7), and homography-based initialization for planar
+scenes.
 
 ## Tier architecture
 
