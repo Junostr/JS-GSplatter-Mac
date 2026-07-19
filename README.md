@@ -297,7 +297,42 @@ Implemented:
     (`cp` reports "Operation not permitted"), so the synthetic suite is the only
     evidence for it so far.
 
-    **Remaining defect: a systematic UNDERestimate.** On synthetic pairs at
+    **Resolved: the sweep range was too narrow, not the estimator.** The real
+    capture kept returning 0.50x — the bottom of the sweep — which looked like a
+    broken estimator hitting a boundary. Dumping the aggregate curve
+    (`SPLAT_FOCAL_DEBUG=1`) showed it strictly monotonic with no interior
+    minimum, confirming the criterion could not discriminate. Extending the
+    sweep down to 0.30x made a clear V appear:
+
+    ```
+    0.30:0.907  0.34:0.609  0.38:0.378  0.42:0.217  0.46:0.210 <- min
+    0.50:0.313  0.58:0.519  ...  1.90:1.678
+    ```
+
+    The true focal is ~0.46x (~95 deg horizontal) — an iPhone **ultra-wide**
+    lens, not the main camera. The estimator had been correct all along; a
+    sweep that cannot express the answer guarantees a boundary result no matter
+    how good the criterion is. Effect on the real capture at `--target 40`:
+
+    | focal | cameras | points | RMSE |
+    |---|---|---|---|
+    | 0.72x (assumed "true", prior) | 6/40 | 911 | 1.65 px |
+    | 0.50x (old sweep floor) | 9/40 | 1013 | 1.10 px |
+    | **0.46x (estimated, extended sweep)** | **20/40** | **1953** | 1.25 px |
+
+    An estimate landing on either END of the sweep is now rejected outright
+    (`return nil`) so the caller falls back to a documented prior rather than a
+    boundary value dressed up as a measurement. The fallback prior itself was
+    also corrected from COLMAP's 1.2x (~45 deg, DSLR-oriented) to 0.72x, since
+    1.2x produced 14.29 px RMSE and zero surviving points on this footage.
+
+    Trade-off, recorded rather than hidden: the wider range gives noise more
+    room to pull a weak estimate downward, and the noisiest synthetic case moved
+    from 0.58x to 0.50x against a true 0.65x. Worth it — a range that cannot
+    express the answer is wrong for *every* capture from that camera, while the
+    noise sensitivity is bounded and characterised below.
+
+    **Residual: a noise-dependent UNDERestimate.** On synthetic pairs at
     1.5 px noise it returns 0.58x for a true 0.65x, 0.65x for 0.80x, and 0.90x
     for 1.10x — tracking the truth but biased ~11-19% low. Real 4K footage is
     noisier still, so it lands on 0.50x (the sweep floor) against a true ~0.72x.

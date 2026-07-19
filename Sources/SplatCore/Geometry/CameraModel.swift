@@ -28,14 +28,19 @@ public struct CameraIntrinsics: Equatable {
 
     /// Initial guess when the capture carries no calibration.
     ///
-    /// 1.2 x the longer image side corresponds to roughly a 50 degree
-    /// horizontal field of view — a reasonable prior for phone and mirrorless
-    /// video, and the value COLMAP uses as its default when EXIF is missing.
-    /// It only needs to be close enough for RANSAC to find a consistent
-    /// inlier set; bundle adjustment refines it later.
+    /// 0.72 x the longer image side, i.e. about a 69 degree horizontal field
+    /// of view — a phone main camera at 4K.
+    ///
+    /// COLMAP's 1.2x default (roughly 45 degrees) is aimed at DSLR-style
+    /// photos and is badly wrong for the footage this app actually receives.
+    /// Measured on a real iPhone capture: 1.2x gave 14.29 px RMSE and ZERO
+    /// surviving points, while ~0.72x gave 0.42 px and a working
+    /// reconstruction. When geometric estimation cannot discriminate (see
+    /// FocalEstimation), this prior is what the pipeline falls back to, so it
+    /// needs to be right for the common case rather than for COLMAP's.
     public static func guess(width: Int, height: Int) -> CameraIntrinsics {
         CameraIntrinsics(
-            focalLength: 1.2 * Double(max(width, height)),
+            focalLength: 0.72 * Double(max(width, height)),
             cx: Double(width) / 2,
             cy: Double(height) / 2
         )

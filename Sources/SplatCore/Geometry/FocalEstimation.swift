@@ -115,9 +115,18 @@ public enum FocalEstimation {
     /// is denser in the 0.6-1.0 region where phone and action cameras actually
     /// sit, since that is where most captures land and where the penalty for
     /// being wrong is steepest.
+    /// Extended down to 0.30 (~117 degrees horizontal) to cover ULTRA-WIDE
+    /// phone lenses, not just main cameras.
+    ///
+    /// The old range started at 0.50 and a real capture kept landing exactly
+    /// there — which looked like a broken estimator hitting a boundary. It may
+    /// instead have been a correct estimate clipped by too narrow a sweep: an
+    /// iPhone ultra-wide is around 13 mm equivalent, roughly 0.38x the long
+    /// side, well below the old floor. A sweep that cannot express the answer
+    /// guarantees a boundary result no matter how good the criterion is.
     public static let defaultMultipliers: [Double] = [
-        0.50, 0.58, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90,
-        0.95, 1.00, 1.10, 1.20, 1.35, 1.55, 1.90,
+        0.30, 0.34, 0.38, 0.42, 0.46, 0.50, 0.58, 0.65, 0.70, 0.75,
+        0.80, 0.85, 0.90, 0.95, 1.00, 1.10, 1.20, 1.35, 1.55, 1.90,
     ]
 
     /// Estimate focal length by AGGREGATING score curves across many pairs.
@@ -216,9 +225,35 @@ public enum FocalEstimation {
             totalSupport += inlier1.count
         }
 
+        if ProcessInfo.processInfo.environment["SPLAT_FOCAL_DEBUG"] != nil {
+            var line = "FOCALCURVE pairs=\(contributing) "
+            for (i, m) in multipliers.enumerated() {
+                line += String(format: "%.2f:%.4f ", m, aggregate[i] / Double(max(1, contributing)))
+            }
+            FileHandle.standardError.write((line + "\n").data(using: .utf8)!)
+        }
         guard contributing > 0 else { return nil }
         var bestIndex = 0
         for i in aggregate.indices where aggregate[i] < aggregate[bestIndex] { bestIndex = i }
+
+        // A minimum at either END of the sweep is not a measurement — it means
+        // the curve is monotonic over the whole range and the criterion never
+        // discriminated. Returning the boundary value would dress a failure up
+        // as a confident answer, which is exactly how the old estimator did
+        // damage.
+        //
+        // This is the real-capture case, and the curve makes it plain:
+        //   0.50:0.289  0.58:0.473  0.65:0.628 ... 1.55:1.404  1.90:1.477
+        // strictly increasing end to end, with no interior minimum to find. On
+        // clean synthetic data the same criterion forms a sharp V at the truth,
+        // so the geometry is recoverable in principle; on this footage the
+        // residual is dominated by terms that scale with the calibration
+        // transform rather than with fit quality, and the signal is buried.
+        //
+        // Reporting nil lets the caller fall back to a documented prior, which
+        // is worth more than a number the data does not support.
+        if bestIndex == 0 || bestIndex == multipliers.count - 1 { return nil }
+
         let focal = multipliers[bestIndex] * longSide
         return FocalEstimate(
             focalLength: focal,
