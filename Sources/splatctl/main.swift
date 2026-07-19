@@ -359,6 +359,9 @@ func runTrain(_ args: [String]) {
     var iterations = 200
     var renderScale = 12
     var saveDir: String?
+    var forceCPU = false
+    var checkpointPath: String?
+    var resumePath: String?
 
     var i = 0
     while i < args.count {
@@ -379,6 +382,9 @@ func runTrain(_ args: [String]) {
             guard let n = Int(value(for: arg)), n > 0 else { fail("--scale needs a positive integer", code: 2) }
             renderScale = n
         case "--save": saveDir = value(for: arg)
+        case "--cpu": forceCPU = true
+        case "--checkpoint": checkpointPath = value(for: arg)
+        case "--resume": resumePath = value(for: arg)
         default:
             if arg.hasPrefix("--") { fail("Unknown flag \(arg)", code: 2) }
             inputPath = arg
@@ -386,7 +392,7 @@ func runTrain(_ args: [String]) {
         i += 1
     }
     guard let inputPath = inputPath else {
-        fail("Usage: splatctl train <input> [--target N] [--iterations N] [--scale N] [--save dir]", code: 2)
+        fail("Usage: splatctl train <input> [--target N] [--iterations N] [--scale N] [--save dir] [--cpu] [--checkpoint file] [--resume file]", code: 2)
     }
 
     let source: IngestionSource
@@ -438,25 +444,38 @@ func runTrain(_ args: [String]) {
 
     var cloud = SplatCloud.fromReconstruction(reconstruction)
     guard cloud.count > 0 else { fail("No splats.") }
+
+    // Resume from a checkpoint if one was given and exists.
+    var startIteration = 0
+    if let resumePath = resumePath, FileManager.default.fileExists(atPath: resumePath) {
+        do {
+            let (restored, restoredIteration) = try SplatCheckpoint.read(from: URL(fileURLWithPath: resumePath))
+            cloud = restored; startIteration = restoredIteration
+            print("Resumed:      \(cloud.count) splats from iteration \(startIteration)")
+        } catch { fail("Could not read checkpoint: \(error)") }
+    }
+
     let extent = SplatOptimizer.sceneExtent(of: cloud)
-    var opts = OptimizerOptions()
-    opts.scaleToScene(extent: extent)
-    let optimizer = SplatOptimizer(splatCount: cloud.count, options: opts)
     print("Splats:       \(cloud.count) initial, scene extent \(String(format: "%.2f", extent))")
     print("Resolution:   \(renderWidth) x \(renderHeight) (1/\(renderScale) scale)")
 
-    // Views that both registered AND have a reference image.
-    let views = reconstruction.cameras.keys.sorted().compactMap { frame -> (Int, RegisteredCamera, [Float])? in
+    let trainingViews = reconstruction.cameras.keys.sorted().compactMap { frame -> TrainingView? in
         guard let camera = reconstruction.cameras[frame], let reference = references[frame] else { return nil }
         var scaled = camera.intrinsics
         scaled.focalLength /= Double(renderScale)
         scaled.cx /= Double(renderScale); scaled.cy /= Double(renderScale)
-        return (frame, RegisteredCamera(frameIndex: frame, pose: camera.pose, intrinsics: scaled), reference)
+        return TrainingView(frameIndex: frame, pose: camera.pose, intrinsics: scaled,
+                            reference: reference, width: renderWidth, height: renderHeight)
     }
-    guard !views.isEmpty else { fail("No views with both a pose and an image.") }
-    print("Views:        \(views.count)")
+    guard !trainingViews.isEmpty else { fail("No views with both a pose and an image.") }
+    print("Views:        \(trainingViews.count)")
 
-    let background = SIMD3<Float>(repeating: 0.05)
+    var trainerOptions = TrainerOptions()
+    trainerOptions.background = SIMD3<Float>(repeating: 0.05)
+    trainerOptions.densifyEnd = iterations - 20
+    let trainer = SplatTrainer(cloud: cloud, views: trainingViews, options: trainerOptions, forceCPU: forceCPU)
+    print("Backend:      \(trainer.backend.descriptionForLog)")
+
     var outURL: URL?
     if let saveDir = saveDir {
         let url = URL(fileURLWithPath: saveDir, isDirectory: true)
@@ -467,52 +486,48 @@ func runTrain(_ args: [String]) {
     let start = Date()
     var firstLoss = 0.0, lastLoss = 0.0
     for iteration in 1...iterations {
-        var accumulated = SplatGradients(count: cloud.count)
-        var epochLoss = 0.0
-        for (_, camera, reference) in views {
-            let (loss, g) = SplatBackward.lossAndGradients(
-                cloud: cloud, pose: camera.pose, intrinsics: camera.intrinsics,
-                width: renderWidth, height: renderHeight, reference: reference, background: background)
-            epochLoss += loss
-            accumulated.add(g)
-        }
-        epochLoss /= Double(views.count)
-        if iteration == 1 { firstLoss = epochLoss }
-        lastLoss = epochLoss
-
-        optimizer.apply(gradients: accumulated, to: &cloud)
-
-        // Densify periodically, and only after the fit has settled a little —
-        // densifying against noise in the first iterations just multiplies bad
-        // splats.
-        if iteration % 50 == 0 && iteration >= 50 && iteration < iterations - 20 {
-            let density = optimizer.densifyAndPrune(cloud: &cloud, gradients: accumulated,
-                                                    sceneExtent: extent)
+        let report = trainer.step()
+        if iteration == 1 { firstLoss = report.loss }
+        lastLoss = report.loss
+        if let density = report.density {
             print(String(format: "  iter %-5d loss %.5f  (+%d cloned, +%d split, -%d pruned -> %d splats)",
-                         iteration, epochLoss, density.cloned, density.split, density.pruned, density.finalCount))
+                         startIteration + iteration, report.loss, density.cloned, density.split,
+                         density.pruned, density.finalCount))
         } else if iteration % 25 == 0 || iteration == 1 {
-            print(String(format: "  iter %-5d loss %.5f  (%d splats)", iteration, epochLoss, cloud.count))
+            print(String(format: "  iter %-5d loss %.5f  (%d splats)",
+                         startIteration + iteration, report.loss, report.splatCount))
+        }
+        // Periodic checkpoint, so a long run survives interruption.
+        if let checkpointPath = checkpointPath, iteration % 100 == 0 {
+            try? SplatCheckpoint.write(trainer.cloud, iteration: startIteration + iteration,
+                                       to: URL(fileURLWithPath: checkpointPath))
         }
     }
 
     print("\n=== Result ===")
     print(String(format: "Loss:         %.5f -> %.5f (%.0f%% reduction)",
                  firstLoss, lastLoss, (1 - lastLoss / max(firstLoss, 1e-12)) * 100))
-    print("Splats:       \(cloud.count)")
+    print("Splats:       \(trainer.cloud.count)")
     print("Elapsed:      \(String(format: "%.1f", Date().timeIntervalSince(start)))s")
 
+    if let checkpointPath = checkpointPath {
+        try? SplatCheckpoint.write(trainer.cloud, iteration: startIteration + iterations,
+                                   to: URL(fileURLWithPath: checkpointPath))
+        print("Checkpoint:   \(checkpointPath)")
+    }
+
     if let outURL = outURL {
-        for (frame, camera, reference) in views.prefix(3) {
-            let image = SplatRasterizer.render(cloud: cloud, pose: camera.pose, intrinsics: camera.intrinsics,
-                                               width: renderWidth, height: renderHeight, background: background)
-            writeRenderPNG(image, to: outURL.appendingPathComponent(String(format: "trained_%05d.png", frame)))
+        for view in trainingViews.prefix(3) {
+            let image = trainer.render(view: view)
+            writeRenderPNG(image, to: outURL.appendingPathComponent(String(format: "trained_%05d.png", view.frameIndex)))
             var ref = RenderTarget(width: renderWidth, height: renderHeight)
-            ref.pixels = reference
-            writeRenderPNG(ref, to: outURL.appendingPathComponent(String(format: "reference_%05d.png", frame)))
+            ref.pixels = view.reference
+            writeRenderPNG(ref, to: outURL.appendingPathComponent(String(format: "reference_%05d.png", view.frameIndex)))
         }
         print("Saved:        renders and references to \(outURL.path)")
     }
 }
+
 
 // MARK: - render (stage 5 forward rasterizer)
 

@@ -4,7 +4,7 @@ Native macOS app that converts a photo series or video into a 3D Gaussian
 Splat. Universal binary (arm64 + x86_64), deployment target **macOS 11.0
 (Big Sur)**, GPU compute via raw Metal — no CUDA anywhere.
 
-## Status: stages 1 (ingestion), 2 (filtering), 3 (SfM), 4 (probe)
+## Status: stages 1 (ingestion), 2 (filtering), 3 (SfM), 4 (probe), 5 (training)
 
 Implemented:
 - **Ingestion** (`SplatCore/Ingestion/`) — photo folders (ImageIO: EXIF
@@ -551,9 +551,30 @@ Implemented:
   of needing no atomics on the legacy GPU. A newer-hardware enhanced tier could
   use `atomic_float` and skip it entirely.
 
-Not yet implemented: checkpoint/resume, wiring the Metal splat kernels into the
-training loop (`splatctl train` still uses the CPU path), viewer (stage 6),
-export (stage 7), and homography-based initialization for planar scenes.
+- **Training loop and checkpoint/resume** (`SplatTrainer`, `SplatCheckpoint`) —
+  completes stage 5. `SplatTrainer` owns the forward/backward → accumulate →
+  Adam → density-control cycle behind a tier-selecting backend
+  (`SplatGradientBackend`) that uses the Metal kernels when a device is present
+  and the verified CPU reference otherwise, so the loop is identical either way
+  and a transient device error degrades rather than ending the run.
+
+  **End to end on the real capture, GPU vs CPU path: 165 s → 98 s** for 200
+  iterations (identical loss trajectory, 0.166 → 0.065, 1953 → 2240 splats).
+
+  `SplatCheckpoint` persists the cloud as a compact little-endian binary (14
+  floats/splat; a 2240-splat scene is 125 KB) with an atomic write, so a crash
+  mid-save cannot replace a good checkpoint with a half-written one — which is
+  exactly when a checkpoint matters. Little-endian is written explicitly rather
+  than dumping native memory, because the universal binary runs on two
+  architectures. Verified: bit-exact and render-identical round-trip, clean
+  failure on short / bad-magic / truncated input, and a real resume that
+  reloads 2240 splats and continues from iteration 200 with loss picking up
+  where it left off. CLI: `splatctl train ... [--checkpoint file] [--resume
+  file] [--cpu]`.
+
+**Stage 5 is complete.** Not yet implemented: viewer (stage 6), export (stage
+7), spherical-harmonic view-dependent colour, and homography-based
+initialization for planar scenes.
 
 ## Tier architecture
 

@@ -2257,5 +2257,103 @@ if let metalBackward = try? MetalSplatBackward() {
     print("  --  (no Metal device — GPU backward tests skipped)")
 }
 
+print("Trainer loop (tier-agnostic) and checkpointing:")
+do {
+    let intrinsics = CameraIntrinsics(focalLength: 260, cx: 40, cy: 30)
+    let width = 80, height = 60
+    let background = SIMD3<Float>(0.05, 0.05, 0.08)
+
+    var truth = SplatCloud()
+    truth.append(Splat(position: SIMD3<Float>(-0.15, 0.05, 2.0),
+                       logScale: SIMD3<Float>(repeating: logf(0.18)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 2.2,
+                       color: SIMD3<Float>(0.9, 0.2, 0.15)))
+    truth.append(Splat(position: SIMD3<Float>(0.18, -0.06, 2.2),
+                       logScale: SIMD3<Float>(repeating: logf(0.2)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 2.0,
+                       color: SIMD3<Float>(0.15, 0.75, 0.35)))
+    let poses: [CameraPose] = [0.0, -6.0, 6.0].map { d in
+        let rot = rotationAboutY(d)
+        let c = SIMD3<Double>(0.2 * sin(d * .pi / 180), 0, 0)
+        let rc = LinearAlgebra.matVec3(rot, c)
+        return CameraPose(rotation: rot, translation: SIMD3<Double>(-rc.x, -rc.y, -rc.z))
+    }
+    let views = poses.enumerated().map { (i, pose) -> TrainingView in
+        let ref = SplatRasterizer.render(cloud: truth, pose: pose, intrinsics: intrinsics,
+                                         width: width, height: height, background: background).pixels
+        return TrainingView(frameIndex: i, pose: pose, intrinsics: intrinsics,
+                            reference: ref, width: width, height: height)
+    }
+
+    var cloud = SplatCloud()
+    cloud.append(Splat(position: SIMD3<Float>(-0.05, 0, 2.1), logScale: SIMD3<Float>(repeating: logf(0.22)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 0.5, color: SIMD3<Float>(repeating: 0.5)))
+    cloud.append(Splat(position: SIMD3<Float>(0.06, 0, 2.1), logScale: SIMD3<Float>(repeating: logf(0.22)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 0.5, color: SIMD3<Float>(repeating: 0.5)))
+
+    var opts = TrainerOptions()
+    opts.background = background
+    opts.optimizer.colorLR = 0.05; opts.optimizer.opacityLR = 0.2; opts.optimizer.scaleLR = 0.02
+    opts.optimizer.positionLR = 0.003
+    opts.densifyStart = 1000    // no density change in this short convergence test
+    let trainer = SplatTrainer(cloud: cloud, views: views, options: opts)
+    print("      backend: \(trainer.backend.descriptionForLog)")
+
+    var first = 0.0, last = 0.0
+    for i in 0..<40 {
+        let report = trainer.step()
+        if i == 0 { first = report.loss }
+        last = report.loss
+    }
+    print(String(format: "      trainer loss %.5f -> %.5f", first, last))
+    expect(last < first * 0.6, "trainer loop reduces loss (\(first) -> \(last))")
+    expect(trainer.cloud.colors.contains { $0.x > 0.6 }, "trainer learns the red colour")
+
+    // If Metal is present, the tier-selecting backend must have used it — the
+    // whole point of this stage. If not, the CPU fallback is legitimate.
+    if (try? MetalSplatBackward()) != nil {
+        expect(trainer.backend.usesMetal, "the trainer uses the Metal backend when available")
+    }
+
+    // Checkpoint round-trip: encode -> decode must reproduce the cloud exactly.
+    let data = SplatCheckpoint.encode(trainer.cloud, iteration: trainer.iteration)
+    let (restored, restoredIteration) = try SplatCheckpoint.decode(data)
+    expect(restoredIteration == trainer.iteration, "iteration survives the round-trip")
+    expect(restored.count == trainer.cloud.count, "splat count survives (\(restored.count))")
+    var maxDiff: Float = 0
+    for i in 0..<restored.count {
+        maxDiff = Swift.max(maxDiff, abs(restored.positions[i].x - trainer.cloud.positions[i].x))
+        maxDiff = Swift.max(maxDiff, abs(restored.opacityLogits[i] - trainer.cloud.opacityLogits[i]))
+        maxDiff = Swift.max(maxDiff, abs(restored.colors[i].y - trainer.cloud.colors[i].y))
+        maxDiff = Swift.max(maxDiff, abs(restored.rotations[i].w - trainer.cloud.rotations[i].w))
+    }
+    expect(maxDiff == 0, "checkpoint is bit-exact (max diff \(maxDiff))")
+
+    // A restored cloud must render identically — the real proof it is usable,
+    // not merely equal field by field.
+    let originalRender = SplatRasterizer.render(cloud: trainer.cloud, pose: poses[0], intrinsics: intrinsics,
+                                                width: width, height: height, background: background)
+    let restoredRender = SplatRasterizer.render(cloud: restored, pose: poses[0], intrinsics: intrinsics,
+                                                width: width, height: height, background: background)
+    let renderDiff = zip(originalRender.pixels, restoredRender.pixels).map { abs($0 - $1) }.max() ?? 1
+    expect(renderDiff == 0, "restored cloud renders identically (diff \(renderDiff))")
+
+    // Corrupt inputs must fail cleanly, not crash.
+    do { _ = try SplatCheckpoint.decode(Data([1, 2, 3])); expect(false, "short data should throw") }
+    catch is SplatCheckpoint.CheckpointError { expect(true, "short checkpoint throws cleanly") }
+    var badMagic = data; badMagic[0] = 0xFF
+    do { _ = try SplatCheckpoint.decode(badMagic); expect(false, "bad magic should throw") }
+    catch is SplatCheckpoint.CheckpointError { expect(true, "bad magic throws cleanly") }
+    let truncated = data.prefix(data.count - 8)
+    do { _ = try SplatCheckpoint.decode(Data(truncated)); expect(false, "truncated data should throw") }
+    catch is SplatCheckpoint.CheckpointError { expect(true, "truncated checkpoint throws cleanly") }
+
+    // File round-trip through disk.
+    let checkpointURL = workDir.appendingPathComponent("state.splt")
+    try SplatCheckpoint.write(trainer.cloud, iteration: trainer.iteration, to: checkpointURL)
+    let (fromDisk, _) = try SplatCheckpoint.read(from: checkpointURL)
+    expect(fromDisk.count == trainer.cloud.count, "checkpoint survives a disk round-trip")
+}
+
 print("\n\(passed) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)
