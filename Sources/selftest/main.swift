@@ -1176,6 +1176,38 @@ do {
     }
 }
 
+print("Focal bias characterisation (diagnostic):")
+do {
+    let width = 1920, height = 1080
+    let longSide = Double(max(width, height))
+    print("      true \\ noise:  0.5px   1.0px   1.5px   2.0px   3.0px")
+    for trueMultiplier in [0.65, 0.80, 1.00, 1.20] {
+        var row = String(format: "      %.2fx        ", trueMultiplier)
+        for sigma in [0.5, 1.0, 1.5, 2.0, 3.0] {
+            let intrinsics = CameraIntrinsics(focalLength: trueMultiplier * longSide,
+                                              cx: Double(width) / 2, cy: Double(height) / 2)
+            var rng = SplitMix64(seed: 31)
+            var pairs: [(keypoints1: [Keypoint], keypoints2: [Keypoint], matches: [FeatureMatch])] = []
+            for p in 0..<14 {
+                let scene = makeSyntheticPair(
+                    pointCount: 140, rotationDegrees: 5 + Double(p % 4) * 2,
+                    baseline: SIMD3<Double>(0.4 + Double(p % 3) * 0.15, 0.03, 0.02),
+                    intrinsics: intrinsics, seed: UInt64(7000 + p))
+                func jitter(_ k: Keypoint) -> Keypoint {
+                    Keypoint(x: k.x + Float(rng.nextGaussian()) * Float(sigma),
+                             y: k.y + Float(rng.nextGaussian()) * Float(sigma),
+                             response: k.response, angle: k.angle, octave: k.octave, scale: k.scale)
+                }
+                pairs.append((scene.kp1.map(jitter), scene.kp2.map(jitter), scene.matches))
+            }
+            let got = FocalEstimation.estimate(pairs: pairs, imageWidth: width, imageHeight: height)
+                .map { $0.focalLength / longSide }
+            row += String(format: "%@  ", got.map { String(format: "%.2f", $0) } ?? " nil")
+        }
+        print(row)
+    }
+}
+
 print("Focal criterion curves (diagnostic):")
 do {
     let width = 1920, height = 1080

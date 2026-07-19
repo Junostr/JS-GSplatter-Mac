@@ -270,6 +270,33 @@ Implemented:
     and 0.90x on the same footage. Measurements are repeatable again, which was
     the point.
 
+    **Bias characterised, and one contributing cause removed.** Sweeping noise
+    against true focal in the harness gives:
+
+    | true \\ noise | 0.5 px | 1.0 px | 1.5 px | 2.0 px | 3.0 px |
+    |---|---|---|---|---|---|
+    | 0.65x | 0.65 | 0.58 | 0.65 | 0.65 | 0.50 |
+    | 0.80x | 0.80 | 0.80 | 0.80 | 0.70 | 0.75 |
+    | 1.00x | 1.00 | 0.90 | 0.85 | 0.70 | 0.70 |
+    | 1.20x | 1.20 | 1.10 | 0.85 | 0.80 | 0.75 |
+
+    It is **exact for every focal at 0.5 px** and degrades toward a ~0.70-0.75x
+    curve-shape prior as noise grows. So accuracy is bounded by keypoint
+    localisation noise, not by the criterion — meaning the fix is to feed it
+    less noise, not to add a correction factor.
+
+    Accordingly the estimator now uses **finest-octave (level 0) matches only**.
+    A corner found on pyramid level k has its coordinates multiplied by 2^k to
+    reach full resolution, and its localisation error with them — an octave-2
+    keypoint carries ~4x the positional error of an octave-0 one. The pyramid
+    earns its place in matching, where scale invariance makes a correspondence
+    findable at all; it has no role here, where the estimator needs precision
+    rather than recall. Coarse matches are used only as a fallback if fewer
+    than 16 fine ones exist. **Not yet validated on the real capture** — macOS
+    revoked this session's access to the source video partway through
+    (`cp` reports "Operation not permitted"), so the synthetic suite is the only
+    evidence for it so far.
+
     **Remaining defect: a systematic UNDERestimate.** On synthetic pairs at
     1.5 px noise it returns 0.58x for a true 0.65x, 0.65x for 0.80x, and 0.90x
     for 1.10x — tracking the truth but biased ~11-19% low. Real 4K footage is

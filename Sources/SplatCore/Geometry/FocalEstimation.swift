@@ -156,13 +156,40 @@ public enum FocalEstimation {
 
         for pair in pairs {
             guard pair.matches.count >= 16 else { continue }
+            // FINEST-OCTAVE MATCHES ONLY.
+            //
+            // Focal accuracy is limited purely by keypoint localisation noise
+            // (measured: exact recovery at 0.5 px, collapsing toward a
+            // curve-shape prior of ~0.70-0.75x by 3 px, for every true focal).
+            // A corner detected on pyramid level k has its coordinates
+            // multiplied by 2^k to reach full resolution, so its localisation
+            // error is multiplied too — an octave-2 keypoint carries roughly 4x
+            // the positional error of an octave-0 one. Feeding those into the
+            // estimator is self-inflicted noise.
+            //
+            // The pyramid earns its place in MATCHING, where scale invariance
+            // is what makes a correspondence findable at all. It has no such
+            // role here: the estimator needs precision, not recall, and there
+            // are plenty of octave-0 matches to work with.
             var px1: [SIMD2<Double>] = [], px2: [SIMD2<Double>] = []
+            var coarse1: [SIMD2<Double>] = [], coarse2: [SIMD2<Double>] = []
             for match in pair.matches {
                 guard match.queryIndex < pair.keypoints1.count,
                       match.trainIndex < pair.keypoints2.count else { continue }
                 let a = pair.keypoints1[match.queryIndex], b = pair.keypoints2[match.trainIndex]
-                px1.append(SIMD2<Double>(Double(a.x), Double(a.y)))
-                px2.append(SIMD2<Double>(Double(b.x), Double(b.y)))
+                if a.octave == 0 && b.octave == 0 {
+                    px1.append(SIMD2<Double>(Double(a.x), Double(a.y)))
+                    px2.append(SIMD2<Double>(Double(b.x), Double(b.y)))
+                } else {
+                    coarse1.append(SIMD2<Double>(Double(a.x), Double(a.y)))
+                    coarse2.append(SIMD2<Double>(Double(b.x), Double(b.y)))
+                }
+            }
+            // Fall back to everything only if the fine matches alone are too
+            // few to fit — a noisy estimate beats none.
+            if px1.count < 16 {
+                px1.append(contentsOf: coarse1)
+                px2.append(contentsOf: coarse2)
             }
             guard px1.count >= 16,
                   let f = TwoViewGeometry.fundamentalRANSAC(p1: px1, p2: px2) else { continue }
