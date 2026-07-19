@@ -399,6 +399,7 @@ func runSfM(_ args: [String]) {
     var plyPath: String?
     var focalOverride: Double?
     var descriptorKind: DescriptorKind = .sift
+    var loopClosure = false
 
     var i = 0
     while i < args.count {
@@ -417,6 +418,7 @@ func runSfM(_ args: [String]) {
             focalOverride = v
         case "--cpu": forceCPU = true
         case "--brief": descriptorKind = .brief
+        case "--loop": loopClosure = true
         case "--ply": plyPath = value(for: arg)
         default:
             if arg.hasPrefix("--") { fail("Unknown flag \(arg)", code: 2) }
@@ -508,6 +510,7 @@ func runSfM(_ args: [String]) {
     let sfmStart = Date()
     guard let (reconstruction, report) = StructureFromMotion.reconstruct(
         featureSets: featureSets, intrinsics: intrinsicsByFrame,
+        options: SfMOptions(loopClosure: loopClosure),
         log: { print("  \($0)") }
     ) else {
         fail("Reconstruction failed — not enough parallax or too few matches.")

@@ -182,14 +182,30 @@ Implemented:
     still decay, consistent with accumulating drift at the widest viewpoint
     changes.
 
-    **Loop closure is implemented but OFF by default** (`SfMOptions.loopClosure`)
-    because it is not yet shown to help. The mechanism works: a cheap probe on
-    the strongest ~120 descriptors scores every pair beyond the sliding window,
-    the best 30 get fully matched, and on the real capture that finds 126
-    candidates and adds 30 long-range pairs. But enabling it did not improve
-    reconstruction, and one measurement was substantially worse. Shipping it on
-    by default would risk silently degrading results, so it is opt-in until
-    there is evidence it earns its place.
+    **Loop closure** (`SfMOptions.loopClosure`, `splatctl sfm --loop`, still off
+    by default). A cheap probe on the strongest ~120 descriptors scores every
+    pair beyond the sliding window; the best candidates are fully matched and
+    then **geometrically verified** — a two-view model with at least 25 inliers
+    AND a 50% inlier ratio — before entering the match graph.
+
+    That verification is the load-bearing part. Accepting candidates on
+    descriptor match count alone actively harmed the reconstruction: 30 pairs
+    added, registration DOWN from 20/40 to 16/40, even with the focal correct.
+    On an orbiting capture of a furnished room, distant frames share plenty of
+    locally-similar texture (fabric, wood grain, foliage) and produce dozens of
+    confident-looking matches corresponding to nothing.
+
+    With verification the result on the real capture is unambiguous: **273
+    candidates, 0 verified, 60 rejected** — and reconstruction is byte-identical
+    to loop closure being off (20/40, 1953 points, 1.252 px). Every candidate
+    was a descriptor coincidence.
+
+    The reason is the footage, not the code: that 17-second clip does not
+    complete a full orbit, so there is no loop to close. Loop closure is
+    therefore *correct but unexercised* — it now provably does no harm when
+    there is no loop, but it has never been shown to help. **Validating it needs
+    a capture that returns to its starting viewpoint**, ideally a full 360
+    degrees with recognisable overlap between the first and last frames.
 
     Two things were fixed getting that far, and both are worth keeping:
     - A reversed-range trap. For the last `matchWindow + 1` frames the inner

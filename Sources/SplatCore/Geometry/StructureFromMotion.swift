@@ -180,18 +180,45 @@ public enum StructureFromMotion {
             candidates.sort {
                 $0.score != $1.score ? $0.score > $1.score : ($0.pair.a, $0.pair.b) < ($1.pair.a, $1.pair.b)
             }
+            // GEOMETRICALLY VERIFY every loop candidate before accepting it.
+            //
+            // Descriptor match count alone is not evidence of a loop. On an
+            // orbiting capture of a furnished room, distant frames share plenty
+            // of locally-similar texture (fabric, wood grain, foliage) and
+            // produce dozens of confident-looking matches that correspond to
+            // nothing. Injecting those into the match graph is worse than
+            // having no loop closure at all: measured with acceptance on match
+            // count alone, 30 added pairs took registration DOWN from 20/40 to
+            // 16/40 even with the focal correct.
+            //
+            // Requiring a two-view model with a healthy inlier ratio is the
+            // standard guard: a genuine loop pair sees the same rigid geometry
+            // and yields a consistent essential matrix, while coincidental
+            // texture matches cannot.
             var found = 0
-            for candidate in candidates.prefix(options.maxLoopPairs) {
-                guard let fa = setsByFrame[candidate.pair.a], let fb = setsByFrame[candidate.pair.b] else { continue }
+            var rejected = 0
+            for candidate in candidates.prefix(options.maxLoopPairs * 2) {
+                guard found < options.maxLoopPairs else { break }
+                guard let fa = setsByFrame[candidate.pair.a], let fb = setsByFrame[candidate.pair.b],
+                      let intrA = intrinsics[candidate.pair.a], let intrB = intrinsics[candidate.pair.b],
+                      let kpA = keypointsByFrame[candidate.pair.a],
+                      let kpB = keypointsByFrame[candidate.pair.b] else { continue }
                 let full = FeatureMatcher.match(query: fa, train: fb)
-                if full.count >= 8 {
-                    pairMatches[candidate.pair] = full
-                    loopPairsAdded.insert(candidate.pair)
-                    found += 1
-                }
+                guard full.count >= 20 else { rejected += 1; continue }
+                guard let verified = TwoViewGeometry.estimate(
+                    matches: full, keypoints1: kpA, keypoints2: kpB,
+                    intrinsics1: intrA, intrinsics2: intrB
+                ) else { rejected += 1; continue }
+                // Both an absolute floor and a ratio: a handful of inliers out
+                // of hundreds of matches is a coincidence, not a loop.
+                let inlierRatio = Double(verified.inliers.count) / Double(full.count)
+                guard verified.inliers.count >= 25, inlierRatio >= 0.5 else { rejected += 1; continue }
+                pairMatches[candidate.pair] = full
+                loopPairsAdded.insert(candidate.pair)
+                found += 1
             }
             if !candidates.isEmpty {
-                log?("loop closure: \(candidates.count) candidates, \(found) added")
+                log?("loop closure: \(candidates.count) candidates, \(found) verified, \(rejected) rejected")
             }
             loopPairs = loopPairsAdded
 
