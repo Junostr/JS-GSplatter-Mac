@@ -2173,5 +2173,89 @@ do {
     expect(gpuTime < cpuTime, "GPU is faster than the CPU reference")
 }
 
+print("Metal backward kernel (parity with the verified CPU gradients):")
+if let metalBackward = try? MetalSplatBackward() {
+    let intrinsics = CameraIntrinsics(focalLength: 300, cx: 64, cy: 48)
+    let width = 128, height = 96
+    let background = SIMD3<Float>(0.05, 0.06, 0.09)
+
+    var rng = SplitMix64(seed: 90210)
+    var cloud = SplatCloud()
+    for _ in 0..<140 {
+        cloud.append(Splat(
+            position: SIMD3<Float>((rng.nextUniform() - 0.5) * 1.4,
+                                   (rng.nextUniform() - 0.5) * 1.0,
+                                   1.6 + rng.nextUniform() * 2.0),
+            // ANISOTROPIC on purpose. An isotropic Gaussian is a sphere, so
+            // rotating it changes nothing and its rotation gradient is exactly
+            // zero — comparing the tiers on that array compares noise to noise
+            // (measured: scale 4.7e-10, i.e. no signal at all). Distinct
+            // per-axis scales give rotation something to actually do.
+            logScale: SIMD3<Float>(logf(0.04 + rng.nextUniform() * 0.06),
+                                   logf(0.09 + rng.nextUniform() * 0.07),
+                                   logf(0.05 + rng.nextUniform() * 0.05)),
+            rotation: SplatMath.normalizeQuaternion(SIMD4<Float>(
+                rng.nextUniform() - 0.5, rng.nextUniform() - 0.5,
+                rng.nextUniform() - 0.5, rng.nextUniform() + 0.5)),
+            opacityLogit: -0.5 + rng.nextUniform() * 3,
+            color: SIMD3<Float>(rng.nextUniform(), rng.nextUniform(), rng.nextUniform())))
+    }
+    let reference = (0..<(width * height * 3)).map { _ in Float(rng.nextUniform()) }
+
+    let (cpuLoss, cpuGradients) = SplatBackward.lossAndGradients(
+        cloud: cloud, pose: .identity, intrinsics: intrinsics,
+        width: width, height: height, reference: reference, background: background)
+
+    if let (gpuLoss, gpuGradients) = try? metalBackward.lossAndGradients(
+        cloud: cloud, pose: .identity, intrinsics: intrinsics,
+        width: width, height: height, reference: reference, background: background) {
+
+        expect(abs(cpuLoss - gpuLoss) < 1e-9, "GPU reports the same loss (\(cpuLoss) vs \(gpuLoss))")
+
+        // Compared against the magnitude actually present, so a near-zero
+        // gradient is not judged by its meaningless relative error.
+        func compareArrays(_ name: String, _ a: [Float], _ b: [Float]) {
+            guard a.count == b.count, !a.isEmpty else {
+                expect(false, "\(name): mismatched sizes")
+                return
+            }
+            let scale = Swift.max(a.map { abs($0) }.max() ?? 0, 1e-12)
+            let worst = zip(a, b).map { abs($0 - $1) }.max() ?? 0
+            expect(worst / scale < 2e-3,
+                   String(format: "%@ matches CPU (worst %.2e, scale %.2e)", name, worst, scale))
+        }
+        compareArrays("dL/dcolor", cpuGradients.colors.flatMap { [$0.x, $0.y, $0.z] },
+                      gpuGradients.colors.flatMap { [$0.x, $0.y, $0.z] })
+        compareArrays("dL/dopacityLogit", cpuGradients.opacityLogits, gpuGradients.opacityLogits)
+        compareArrays("dL/dposition", cpuGradients.positions.flatMap { [$0.x, $0.y, $0.z] },
+                      gpuGradients.positions.flatMap { [$0.x, $0.y, $0.z] })
+        compareArrays("dL/dlogScale", cpuGradients.logScales.flatMap { [$0.x, $0.y, $0.z] },
+                      gpuGradients.logScales.flatMap { [$0.x, $0.y, $0.z] })
+        compareArrays("dL/drotation", cpuGradients.rotations.flatMap { [$0.x, $0.y, $0.z, $0.w] },
+                      gpuGradients.rotations.flatMap { [$0.x, $0.y, $0.z, $0.w] })
+        compareArrays("screenGradient", cpuGradients.screenGradient, gpuGradients.screenGradient)
+
+        // Speed where the CPU backward is the real bottleneck.
+        let bigW = 480, bigH = 360
+        let bigReference = (0..<(bigW * bigH * 3)).map { _ in Float(rng.nextUniform()) }
+        let cpuStart = Date()
+        _ = SplatBackward.lossAndGradients(cloud: cloud, pose: .identity, intrinsics: intrinsics,
+                                           width: bigW, height: bigH, reference: bigReference,
+                                           background: background)
+        let cpuTime = Date().timeIntervalSince(cpuStart)
+        let gpuStart = Date()
+        _ = try? metalBackward.lossAndGradients(cloud: cloud, pose: .identity, intrinsics: intrinsics,
+                                                width: bigW, height: bigH, reference: bigReference,
+                                                background: background)
+        let gpuTime = Date().timeIntervalSince(gpuStart)
+        print(String(format: "      backward %dx%d: CPU %.1f ms, GPU %.1f ms (%.1fx)",
+                     bigW, bigH, cpuTime * 1000, gpuTime * 1000, cpuTime / Swift.max(gpuTime, 1e-9)))
+    } else {
+        expect(false, "Metal backward produced gradients")
+    }
+} else {
+    print("  --  (no Metal device — GPU backward tests skipped)")
+}
+
 print("\n\(passed) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

@@ -216,7 +216,38 @@ public enum SplatBackward {
             gradients.colors[splat.index] += gColor
         }
 
-        // Screen space -> parameter space, once per splat.
+        // Screen space -> parameter space, once per splat. Shared with the
+        // Metal path so the tiers cannot diverge in the one piece of maths that
+        // needed finite differences to verify.
+        applyScreenGradients(cloud: cloud, pose: pose, intrinsics: intrinsics,
+                             projected: projected, dLdCentre: dLdCentre,
+                             dLdConic: dLdConic, dLdOpacity: dLdOpacity,
+                             into: &gradients)
+        return (loss, gradients)
+    }
+
+
+    /// Convert accumulated SCREEN-space gradients into parameter gradients.
+    ///
+    /// Factored out rather than duplicated because both tiers need it and it is
+    /// the part of the derivation that finite differences had to be brought in
+    /// to verify — two copies would be two chances to get the covariance or
+    /// quaternion chain subtly wrong, and only one of them would be tested.
+    /// The Metal path computes the per-pixel accumulation on the GPU and then
+    /// calls straight into this.
+    public static func applyScreenGradients(
+        cloud: SplatCloud,
+        pose: CameraPose,
+        intrinsics: CameraIntrinsics,
+        projected: [ProjectedSplat],
+        dLdCentre: [SIMD2<Float>],
+        dLdConic: [SIMD3<Float>],
+        dLdOpacity: [Float],
+        into gradients: inout SplatGradients
+    ) {
+        let r = pose.rotation.map { Float($0) }
+        let t = SIMD3<Float>(Float(pose.translation.x), Float(pose.translation.y), Float(pose.translation.z))
+        let fx = Float(intrinsics.focalLength), fy = Float(intrinsics.focalLength)
         for slot in projected.indices {
             let splat = projected[slot]
             let i = splat.index
@@ -363,7 +394,6 @@ public enum SplatBackward {
                 r[2] * dLdCamera.x + r[5] * dLdCamera.y + r[8] * dLdCamera.z
             )
         }
-        return (loss, gradients)
     }
 
     @inline(__always)

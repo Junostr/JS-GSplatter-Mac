@@ -529,9 +529,31 @@ Implemented:
   rounding. Measured divergence 5.3e-3 before the kernel applied the same
   bounds test as the reference.
 
-Not yet implemented: the Metal backward kernel, checkpoint/resume, viewer
-(stage 6), export (stage 7), and homography-based initialization for planar
-scenes.
+- **Metal backward kernel** (`MetalSplatBackward`) — the per-pixel gradient
+  accumulation on the GPU, ~2.1× faster than the CPU reference (547 → 260 ms at
+  480×360) and matching its finite-difference-verified gradients to ~1e-8
+  across all five parameters plus the screen gradient.
+
+  The backward pass *scatters* — every pixel a splat covers contributes to that
+  splat's gradient — which normally wants float atomics. `atomic_float` add is
+  unavailable on `GPUFamilyMac1`, so instead each threadgroup owns a tile and,
+  for each splat in the tile, reduces its threads' contributions in threadgroup
+  memory and writes one per-(tile, splat) partial. No atomics anywhere; the CPU
+  sums the partials and runs the per-splat screen→parameter chain.
+
+  That last chain is **shared** with the CPU tier (`applyScreenGradients`), not
+  reimplemented in MSL — it's the one piece of maths in the project that needed
+  finite differences to verify, and two copies would be two chances to get the
+  covariance or quaternion derivative subtly wrong with only one tested.
+
+  The ~2.1× is deliberate, not a ceiling: the reduction runs 9 slots ×
+  log₂(256) barriers per splat per tile, heavy synchronization that is the price
+  of needing no atomics on the legacy GPU. A newer-hardware enhanced tier could
+  use `atomic_float` and skip it entirely.
+
+Not yet implemented: checkpoint/resume, wiring the Metal splat kernels into the
+training loop (`splatctl train` still uses the CPU path), viewer (stage 6),
+export (stage 7), and homography-based initialization for planar scenes.
 
 ## Tier architecture
 
