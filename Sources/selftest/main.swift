@@ -1621,5 +1621,177 @@ do {
     expect(sameShuffledPoses, "SfM poses are identical regardless of input order")
 }
 
+// MARK: - Stage 5: splat model and forward rasterization
+
+print("Splat model:")
+do {
+    // Covariance of an axis-aligned, identity-rotation Gaussian must be
+    // diag(s²) exactly — a case where the answer is known analytically rather
+    // than merely self-consistent.
+    let logScale = SIMD3<Float>(logf(2), logf(3), logf(4))
+    let identity = SIMD4<Float>(0, 0, 0, 1)
+    let (c00, c01, c02, c11, c12, c22) =
+        SplatMath.covariance3D(logScale: logScale, rotation: identity)
+    expect(abs(c00 - 4) < 1e-4 && abs(c11 - 9) < 1e-4 && abs(c22 - 16) < 1e-4,
+           "identity rotation gives diag(s²) (got \(c00), \(c11), \(c22))")
+    expect(abs(c01) < 1e-5 && abs(c02) < 1e-5 && abs(c12) < 1e-5,
+           "identity rotation leaves no off-diagonal terms")
+
+    // A 90-degree rotation about Z must swap the x and y extents.
+    let halfPi = Float.pi / 4     // quaternion half-angle
+    let zRotation = SIMD4<Float>(0, 0, sinf(halfPi), cosf(halfPi))
+    let rotated = SplatMath.covariance3D(logScale: logScale, rotation: zRotation)
+    expect(abs(rotated.0 - 9) < 1e-3 && abs(rotated.3 - 4) < 1e-3,
+           "90° about Z swaps the x/y extents (got \(rotated.0), \(rotated.3))")
+    expect(abs(rotated.5 - 16) < 1e-3, "rotation about Z leaves the z extent alone")
+
+    // Covariance must be symmetric positive semi-definite: all leading minors
+    // non-negative. A violation here means every downstream inverse is garbage.
+    expect(c00 > 0 && c11 > 0 && c22 > 0, "diagonal is positive")
+    expect(c00 * c11 - c01 * c01 > 0, "2x2 leading minor is positive")
+
+    // Unnormalised quaternions must be handled, not trusted.
+    let unnormalised = SIMD4<Float>(0, 0, 3, 3)
+    let fromUnnormalised = SplatMath.covariance3D(logScale: logScale, rotation: unnormalised)
+    expect(abs(fromUnnormalised.0 - 9) < 1e-3,
+           "quaternion is normalised before use (got \(fromUnnormalised.0))")
+
+    // Log/logit round-trips.
+    let splat = Splat(position: .zero, logScale: SIMD3<Float>(repeating: logf(0.25)),
+                      rotation: identity, opacityLogit: logf(0.3 / 0.7), color: .zero)
+    expect(abs(splat.scale.x - 0.25) < 1e-5, "log-scale round-trips (got \(splat.scale.x))")
+    expect(abs(splat.opacity - 0.3) < 1e-5, "opacity logit round-trips (got \(splat.opacity))")
+}
+
+print("Splat projection (EWA):")
+do {
+    let intrinsics = CameraIntrinsics(focalLength: 800, cx: 320, cy: 240)
+    var cloud = SplatCloud()
+    // One splat straight ahead at z = 4.
+    cloud.append(Splat(position: SIMD3<Float>(0, 0, 4),
+                       logScale: SIMD3<Float>(repeating: logf(0.05)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1),
+                       opacityLogit: 2, color: SIMD3<Float>(1, 0, 0)))
+    let projected = SplatRasterizer.project(
+        cloud: cloud, pose: .identity, intrinsics: intrinsics, width: 640, height: 480)
+    expect(projected.count == 1, "splat in front of the camera projects")
+    if let p = projected.first {
+        expect(abs(p.centre.x - 320) < 0.01 && abs(p.centre.y - 240) < 0.01,
+               "a splat on the optical axis lands at the principal point (got \(p.centre))")
+        expect(abs(p.depth - 4) < 1e-5, "depth is the camera-space z")
+        // A 0.05-radius sphere at z=4 with f=800 subtends ~10 px, so 3σ is ~30.
+        expect(p.radius > 5 && p.radius < 60, "screen radius is plausible (got \(p.radius))")
+    }
+
+    // Behind-camera and near-plane culling.
+    var behind = SplatCloud()
+    behind.append(Splat(position: SIMD3<Float>(0, 0, -2), logScale: SIMD3<Float>(repeating: logf(0.05)),
+                        rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 2, color: .zero))
+    expect(SplatRasterizer.project(cloud: behind, pose: .identity, intrinsics: intrinsics,
+                                   width: 640, height: 480).isEmpty,
+           "splats behind the camera are culled")
+
+    // Perspective: the same splat twice as far must project to half the radius.
+    var near = SplatCloud(), far = SplatCloud()
+    let s = SIMD3<Float>(repeating: logf(0.05))
+    near.append(Splat(position: SIMD3<Float>(0, 0, 4), logScale: s,
+                      rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 2, color: .zero))
+    far.append(Splat(position: SIMD3<Float>(0, 0, 8), logScale: s,
+                     rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 2, color: .zero))
+    let rNear = SplatRasterizer.project(cloud: near, pose: .identity, intrinsics: intrinsics,
+                                        width: 640, height: 480).first?.radius ?? 0
+    let rFar = SplatRasterizer.project(cloud: far, pose: .identity, intrinsics: intrinsics,
+                                       width: 640, height: 480).first?.radius ?? 0
+    let ratio = rNear / Swift.max(rFar, 1e-6)
+    expect(abs(ratio - 2) < 0.15, "doubling depth halves the screen radius (ratio \(ratio))")
+}
+
+print("Forward rasterization:")
+do {
+    let intrinsics = CameraIntrinsics(focalLength: 400, cx: 64, cy: 48)
+    let width = 128, height = 96
+
+    // Empty scene shows pure background.
+    let empty = SplatRasterizer.render(cloud: SplatCloud(), pose: .identity,
+                                       intrinsics: intrinsics, width: width, height: height,
+                                       background: SIMD3<Float>(0.25, 0.5, 0.75))
+    let bg = empty.pixel(x: 10, y: 10)
+    expect(abs(bg.x - 0.25) < 1e-5 && abs(bg.y - 0.5) < 1e-5 && abs(bg.z - 0.75) < 1e-5,
+           "empty scene renders the background exactly")
+
+    // One near-opaque red splat at the centre.
+    var cloud = SplatCloud()
+    cloud.append(Splat(position: SIMD3<Float>(0, 0, 2),
+                       logScale: SIMD3<Float>(repeating: logf(0.08)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1),
+                       opacityLogit: 6,                     // ~0.9975
+                       color: SIMD3<Float>(1, 0, 0)))
+    let rendered = SplatRasterizer.render(cloud: cloud, pose: .identity, intrinsics: intrinsics,
+                                          width: width, height: height,
+                                          background: SIMD3<Float>(0, 0, 1))
+    let centre = rendered.pixel(x: 64, y: 48)
+    expect(centre.x > 0.8, "splat centre is dominated by its colour (got \(centre.x))")
+    expect(centre.z < 0.3, "splat centre occludes the background (blue \(centre.z))")
+    let corner = rendered.pixel(x: 2, y: 2)
+    expect(corner.z > 0.9, "far from the splat, background shows through (blue \(corner.z))")
+    expect(rendered.transmittance[48 * width + 64] < 0.05,
+           "transmittance is consumed under an opaque splat")
+
+    // Occlusion: a near opaque splat must hide a far one of a different colour.
+    var occluded = SplatCloud()
+    occluded.append(Splat(position: SIMD3<Float>(0, 0, 2), logScale: SIMD3<Float>(repeating: logf(0.08)),
+                          rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 6, color: SIMD3<Float>(1, 0, 0)))
+    occluded.append(Splat(position: SIMD3<Float>(0, 0, 5), logScale: SIMD3<Float>(repeating: logf(0.2)),
+                          rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 6, color: SIMD3<Float>(0, 1, 0)))
+    let occludedRender = SplatRasterizer.render(cloud: occluded, pose: .identity, intrinsics: intrinsics,
+                                                width: width, height: height)
+    let front = occludedRender.pixel(x: 64, y: 48)
+    expect(front.x > 0.8 && front.y < 0.2,
+           "the nearer splat occludes the farther one (r \(front.x), g \(front.y))")
+
+    // Depth order must not depend on input order.
+    var reversed = SplatCloud()
+    reversed.append(occluded[1]); reversed.append(occluded[0])
+    let reversedRender = SplatRasterizer.render(cloud: reversed, pose: .identity, intrinsics: intrinsics,
+                                                width: width, height: height)
+    let maxDiff = zip(occludedRender.pixels, reversedRender.pixels).map { abs($0 - $1) }.max() ?? 1
+    expect(maxDiff < 1e-6, "render is independent of splat input order (max diff \(maxDiff))")
+
+    // Energy conservation: transmittance plus accumulated alpha stays in range.
+    let allInRange = rendered.pixels.allSatisfy { $0 >= -1e-6 && $0 <= 1 + 1e-4 }
+    expect(allInRange, "no pixel exceeds the valid intensity range")
+    expect(rendered.transmittance.allSatisfy { $0 >= -1e-6 && $0 <= 1 + 1e-6 },
+           "transmittance stays within [0, 1]")
+}
+
+print("Splat initialization from SfM:")
+do {
+    var reconstruction = Reconstruction()
+    reconstruction.cameras[0] = RegisteredCamera(frameIndex: 0, pose: .identity,
+                                                 intrinsics: CameraIntrinsics(focalLength: 100, cx: 50, cy: 50))
+    // A tight cluster and a lone distant point: initial scales must differ.
+    for p in [SIMD3<Double>(0, 0, 5), SIMD3<Double>(0.05, 0, 5), SIMD3<Double>(0, 0.05, 5),
+              SIMD3<Double>(0.05, 0.05, 5), SIMD3<Double>(8, 8, 12)] {
+        reconstruction.points.append(ScenePoint(position: p, observations: [(0, 0), (0, 1)]))
+    }
+    let cloud = SplatCloud.fromReconstruction(reconstruction)
+    expect(cloud.count == 5, "one splat per sparse point (got \(cloud.count))")
+    expect(cloud.opacityLogits.allSatisfy { $0 < 0 }, "splats start with low opacity")
+    let clusterScale = expf(cloud.logScales[0].x)
+    let lonelyScale = expf(cloud.logScales[4].x)
+    expect(lonelyScale > clusterScale * 5,
+           "isolated points start larger than clustered ones (\(lonelyScale) vs \(clusterScale))")
+    expect(cloud.rotations.allSatisfy { $0.w == 1 }, "splats start unrotated")
+
+    // Coincident points must not produce log(0) = -inf.
+    var degenerate = Reconstruction()
+    degenerate.points = (0..<3).map { _ in
+        ScenePoint(position: SIMD3<Double>(1, 1, 1), observations: [(0, 0), (0, 1)])
+    }
+    let degenerateCloud = SplatCloud.fromReconstruction(degenerate)
+    expect(degenerateCloud.logScales.allSatisfy { $0.x.isFinite },
+           "coincident points do not produce infinite log-scale")
+}
+
 print("\n\(passed) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)

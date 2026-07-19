@@ -395,8 +395,34 @@ Implemented:
     configuration fits many focal lengths about equally well. Needs a
     stability check across pairs, and probably the planar fix first.
 
-Not yet implemented: real training kernels (stage 5), viewer (stage 6),
-export (stage 7), and homography-based initialization for planar scenes.
+- **Splat model and forward rasterizer** (`SplatCore/Splatting/`) — first
+  half of stage 5. Struct-of-arrays `SplatCloud` (position, log-scale,
+  quaternion, opacity logit, colour), 3D covariance as Σ = R S Sᵀ Rᵀ, EWA
+  projection to screen space, and a front-to-back alpha-compositing rasterizer
+  with early termination. `SplatCloud.fromReconstruction` is the stage 3 → 5
+  handoff: one Gaussian per sparse point, initial radius from nearest-neighbour
+  distance so density follows structure.
+
+  Parameters are stored in *unconstrained* form — log for scale, logit for
+  opacity — so gradient steps need no projection back onto a valid range, and a
+  fixed learning rate behaves the same for a huge splat as a tiny one.
+
+  Verified against analytically known answers rather than self-consistency:
+  identity rotation gives exactly `diag(s²)`, a 90° rotation about Z swaps the
+  x/y extents exactly, doubling depth halves the screen radius to within 0.4%,
+  a nearer splat occludes a farther one, and the render is bit-identical under
+  reordered input.
+
+  `splatctl render <input> --save <dir>` runs ingestion → filtering → SfM →
+  splat init → render from every registered pose. On the real capture it
+  produces coherent grey fog: correct, since an untrained cloud is by
+  definition uniform mid-grey blobs. Making it resemble the input needs the
+  backward pass.
+
+Not yet implemented: the training half of stage 5 (backward pass, optimizer,
+adaptive density control, checkpoint/resume) and its Metal kernels, viewer
+(stage 6), export (stage 7), and homography-based initialization for planar
+scenes.
 
 ## Tier architecture
 

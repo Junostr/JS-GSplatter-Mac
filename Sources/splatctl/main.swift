@@ -39,8 +39,10 @@ case "sfm":
     runSfM(args)
 case "features":
     runFeatures(args)
+case "render":
+    runRender(args)
 default:
-    fail("Unknown command '\(command)'. Commands: probe, ingest, filter, sfm, features", code: 2)
+    fail("Unknown command '\(command)'. Commands: probe, ingest, filter, sfm, features, render", code: 2)
 }
 
 // MARK: - probe
@@ -308,6 +310,149 @@ func runFilter(_ args: [String]) {
             fail("Saving selected frames failed: \(error)")
         }
     }
+}
+
+// MARK: - render (stage 5 forward rasterizer)
+
+/// Reconstruct, initialize splats from the sparse cloud, and render from each
+/// registered camera. Proves the stage 3 -> stage 5 handoff end to end: if the
+/// poses and the splat projection disagree, the render will not resemble the
+/// input frames.
+func runRender(_ args: [String]) {
+    var inputPath: String?
+    var target = 40
+    var saveDir: String?
+
+    var i = 0
+    while i < args.count {
+        let arg = args[i]
+        func value(for flag: String) -> String {
+            i += 1
+            guard i < args.count else { fail("Missing value for \(flag)", code: 2) }
+            return args[i]
+        }
+        switch arg {
+        case "--target":
+            guard let n = Int(value(for: arg)), n > 0 else { fail("--target needs a positive integer", code: 2) }
+            target = n
+        case "--save": saveDir = value(for: arg)
+        default:
+            if arg.hasPrefix("--") { fail("Unknown flag \(arg)", code: 2) }
+            inputPath = arg
+        }
+        i += 1
+    }
+    guard let inputPath = inputPath else {
+        fail("Usage: splatctl render <photo-folder|video> [--target N] [--save <dir>]", code: 2)
+    }
+
+    let source: IngestionSource
+    do { source = try IngestionSource.detect(at: URL(fileURLWithPath: inputPath)) }
+    catch { fail("\(error)") }
+
+    let analyzer = FrameAnalyzerFactory.make()
+    let extractor = FeatureExtractorFactory.make()
+    print("=== Render ===")
+    print("Source:       \(source.frameCountEstimateLabel)")
+
+    var scores: [FrameScore] = []
+    do {
+        try FrameIngestor.ingest(source) { frame in
+            scores.append(try analyzer.analyze(index: frame.index, timestamp: frame.timestamp,
+                                               pixelBuffer: frame.pixelBuffer))
+            return true
+        }
+    } catch { fail("Analysis failed: \(error)") }
+    let selection = FrameSelector.select(
+        scores: scores, options: FilterOptions(targetFrameCount: target, dedupMinDistance: 0.001))
+    let wanted = Set(selection.selected.map { $0.index })
+
+    var featureSets: [FeatureSet] = []
+    var intrinsicsByFrame: [Int: CameraIntrinsics] = [:]
+    var frameWidth = 0, frameHeight = 0
+    do {
+        try FrameIngestor.ingest(source) { frame in
+            guard wanted.contains(frame.index) else { return true }
+            featureSets.append(try extractor.extract(index: frame.index, pixelBuffer: frame.pixelBuffer,
+                                                     options: FeatureOptions(maxFeatures: 1500)))
+            frameWidth = frame.width; frameHeight = frame.height
+            intrinsicsByFrame[frame.index] = CameraIntrinsics.guess(width: frame.width, height: frame.height)
+            return true
+        }
+    } catch { fail("Feature extraction failed: \(error)") }
+
+    if let estimate = FocalEstimation.estimate(featureSets: featureSets,
+                                               imageWidth: frameWidth, imageHeight: frameHeight) {
+        for key in intrinsicsByFrame.keys { intrinsicsByFrame[key]?.focalLength = estimate.focalLength }
+        print("Intrinsics:   focal ≈ \(Int(estimate.focalLength)) px (estimated)")
+    }
+
+    guard let (reconstruction, report) = StructureFromMotion.reconstruct(
+        featureSets: featureSets, intrinsics: intrinsicsByFrame) else {
+        fail("Reconstruction failed.")
+    }
+    print("Cameras:      \(report.registeredCameras)/\(report.totalCameras)")
+    print("Points:       \(report.points)")
+
+    let cloud = SplatCloud.fromReconstruction(reconstruction)
+    print("Splats:       \(cloud.count) initialized from the sparse cloud")
+    guard cloud.count > 0 else { fail("No splats to render.") }
+
+    // Render at a reduced size: this is the CPU reference rasterizer, and 4K
+    // per camera is pointless for a sanity check.
+    let scale = 8
+    let rw = max(1, frameWidth / scale), rh = max(1, frameHeight / scale)
+    var outURL: URL?
+    if let saveDir = saveDir {
+        let url = URL(fileURLWithPath: saveDir, isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        outURL = url
+    }
+
+    let start = Date()
+    var rendered = 0
+    for frame in reconstruction.cameras.keys.sorted() {
+        guard let camera = reconstruction.cameras[frame] else { continue }
+        var intr = camera.intrinsics
+        intr.focalLength /= Double(scale); intr.cx /= Double(scale); intr.cy /= Double(scale)
+        let image = SplatRasterizer.render(cloud: cloud, pose: camera.pose, intrinsics: intr,
+                                           width: rw, height: rh,
+                                           background: SIMD3<Float>(repeating: 0.05))
+        let covered = image.transmittance.filter { $0 < 0.99 }.count
+        print(String(format: "  frame %-5d %d x %d, %.1f%% of pixels covered by splats",
+                     frame, rw, rh, 100.0 * Double(covered) / Double(rw * rh)))
+        if let outURL = outURL {
+            writeRenderPNG(image, to: outURL.appendingPathComponent(String(format: "render_%05d.png", frame)))
+        }
+        rendered += 1
+    }
+    print("Rendered:     \(rendered) views in \(String(format: "%.2f", Date().timeIntervalSince(start)))s")
+    if let outURL = outURL { print("Saved to:     \(outURL.path)") }
+}
+
+func writeRenderPNG(_ image: RenderTarget, to url: URL) {
+    guard let ctx = CGContext(data: nil, width: image.width, height: image.height,
+                              bitsPerComponent: 8, bytesPerRow: 0,
+                              space: CGColorSpaceCreateDeviceRGB(),
+                              bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                        | CGBitmapInfo.byteOrder32Little.rawValue),
+          let data = ctx.data else { return }
+    let bytes = data.assumingMemoryBound(to: UInt8.self)
+    for y in 0..<image.height {
+        for x in 0..<image.width {
+            let p = image.pixel(x: x, y: y)
+            let o = y * ctx.bytesPerRow + x * 4
+            bytes[o + 0] = UInt8(max(0, min(255, p.z * 255)))
+            bytes[o + 1] = UInt8(max(0, min(255, p.y * 255)))
+            bytes[o + 2] = UInt8(max(0, min(255, p.x * 255)))
+            bytes[o + 3] = 255
+        }
+    }
+    guard let cg = ctx.makeImage(),
+          let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)
+    else { return }
+    CGImageDestinationAddImage(dest, cg, nil)
+    _ = CGImageDestinationFinalize(dest)
 }
 
 // MARK: - features (visual diagnostic)
