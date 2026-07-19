@@ -451,10 +451,40 @@ Implemented:
   moved rotation agreement from 2% to 54% while the analytic value barely
   moved, which is a noisy *reference*, not a wrong derivative.
 
-Not yet implemented: the optimizer and adaptive density control (clone / split
-/ prune), checkpoint/resume, the Metal kernels for the splatting path, viewer
-(stage 6), export (stage 7), and homography-based initialization for planar
-scenes.
+- **Optimizer and adaptive density control** (`SplatOptimizer`) — Adam with
+  per-group learning rates, plus the clone / split / prune cycle that lets the
+  splat count adapt to the scene. Density control is what makes 3DGS work at
+  all: SfM yields a few thousand sparse points where a detailed scene needs
+  hundreds of thousands of Gaussians, and no amount of gradient descent on a
+  fixed set can create detail where there are no primitives.
+
+  - **Clone** a small splat with a high screen-space gradient (under-covering
+    its region), **split** a large one (spanning detail it cannot represent)
+    into two children at 1/1.6 scale, offset by sampling the parent's own
+    distribution, **prune** anything below `minOpacity` or above `maxWorldSize`.
+  - Density keys off the **screen-space** gradient, not the world one: that
+    signal is depth-independent, whereas a distant splat needs a far larger
+    world movement to shift the same number of pixels.
+  - Position learning rate scales with scene extent, because SfM fixes geometry
+    only up to a similarity — a fixed rate is a crawl in one reconstruction and
+    a catastrophe in another.
+  - New splats get **zero** Adam moments rather than inheriting the parent's,
+    which would apply momentum built from a different geometry.
+
+  Verified end to end: starting from a displaced, mis-sized, grey cloud and
+  training against renders of a known target from 3 viewpoints, **loss falls
+  92% in 60 iterations** and the splats learn the *correct* colours (red → 1.0
+  red, green → 1.0 green) rather than reducing loss by blurring to the mean.
+
+  One threshold relationship is load-bearing and pinned by a test:
+  `sizeThreshold` (split above this) must stay well below `maxWorldSize` (prune
+  above this). Set equal, every splat large enough to split is also large enough
+  to prune, so each split is undone in the same pass and its children
+  discarded — measured as 4 pruned instead of 2. Defaults leave a 10× band.
+
+Not yet implemented: checkpoint/resume, the Metal kernels for the splatting
+path, viewer (stage 6), export (stage 7), and homography-based initialization
+for planar scenes.
 
 ## Tier architecture
 

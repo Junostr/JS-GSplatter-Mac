@@ -26,12 +26,38 @@ public struct SplatGradients {
     public var opacityLogits: [Float]
     public var colors: [SIMD3<Float>]
 
+    /// Magnitude of the SCREEN-SPACE position gradient, accumulated across
+    /// views. This is what adaptive density control keys off, not the world
+    /// gradient: a splat is under-reconstructed when the image is pulling its
+    /// projection around, and that signal is scale- and depth-independent in a
+    /// way the world-space gradient is not (a distant splat needs a far larger
+    /// world movement to shift the same number of pixels).
+    public var screenGradient: [Float]
+    /// How many views each splat was visible in, so the screen gradient can be
+    /// averaged rather than biased toward splats seen from many cameras.
+    public var visibleCount: [Int]
+
     public init(count: Int) {
         positions = Array(repeating: .zero, count: count)
         logScales = Array(repeating: .zero, count: count)
         rotations = Array(repeating: .zero, count: count)
         opacityLogits = Array(repeating: 0, count: count)
         colors = Array(repeating: .zero, count: count)
+        screenGradient = Array(repeating: 0, count: count)
+        visibleCount = Array(repeating: 0, count: count)
+    }
+
+    /// Accumulate another view's gradients into this one.
+    public mutating func add(_ other: SplatGradients) {
+        for i in 0..<Swift.min(positions.count, other.positions.count) {
+            positions[i] += other.positions[i]
+            logScales[i] += other.logScales[i]
+            rotations[i] += other.rotations[i]
+            opacityLogits[i] += other.opacityLogits[i]
+            colors[i] += other.colors[i]
+            screenGradient[i] += other.screenGradient[i]
+            visibleCount[i] += other.visibleCount[i]
+        }
     }
 }
 
@@ -316,6 +342,11 @@ public enum SplatBackward {
                 for col in 0..<3 { dLdR[row * 3 + col] = dLdM[row * 3 + col] * s[col] }
             }
             gradients.rotations[i] += quaternionGradient(q: cloud.rotations[i], dLdR: dLdR)
+
+            // Screen-space signal for density control.
+            let gc2 = dLdCentre[slot]
+            gradients.screenGradient[i] += (gc2.x * gc2.x + gc2.y * gc2.y).squareRoot()
+            gradients.visibleCount[i] += 1
 
             // Camera-space position also moves the 2D covariance (through J),
             // not only the centre. Omitting that term is a classic silent error:

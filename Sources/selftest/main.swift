@@ -1903,5 +1903,183 @@ do {
            "a culled splat receives exactly zero gradient")
 }
 
+print("Optimizer and training (does it actually learn?):")
+do {
+    // The end-to-end proof: render a known TARGET scene, then start from a
+    // deliberately wrong cloud and check training closes the gap. Gradients
+    // being individually correct does not guarantee the loop that consumes
+    // them is wired correctly — sign, learning rate and state alignment can all
+    // be wrong in ways finite differences never see.
+    let intrinsics = CameraIntrinsics(focalLength: 260, cx: 32, cy: 24)
+    let width = 64, height = 48
+
+    var truth = SplatCloud()
+    truth.append(Splat(position: SIMD3<Float>(-0.18, 0.05, 2.0),
+                       logScale: SIMD3<Float>(repeating: logf(0.16)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1),
+                       opacityLogit: 2.2, color: SIMD3<Float>(0.9, 0.2, 0.15)))
+    truth.append(Splat(position: SIMD3<Float>(0.2, -0.08, 2.2),
+                       logScale: SIMD3<Float>(repeating: logf(0.19)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1),
+                       opacityLogit: 2.0, color: SIMD3<Float>(0.15, 0.75, 0.35)))
+
+    // A few viewpoints, so the fit is constrained in 3D rather than a single
+    // 2D projection that many wrong clouds could match.
+    let poses: [CameraPose] = [0.0, -7.0, 7.0].map { degrees in
+        let rot = rotationAboutY(degrees)
+        let centre = SIMD3<Double>(0.25 * sin(degrees * .pi / 180), 0, 0)
+        let rc = LinearAlgebra.matVec3(rot, centre)
+        return CameraPose(rotation: rot, translation: SIMD3<Double>(-rc.x, -rc.y, -rc.z))
+    }
+    let background = SIMD3<Float>(0.05, 0.05, 0.08)
+    let references = poses.map { pose -> [Float] in
+        SplatRasterizer.render(cloud: truth, pose: pose, intrinsics: intrinsics,
+                               width: width, height: height, background: background).pixels
+    }
+
+    // Start wrong: displaced, mis-sized, grey, and too transparent.
+    var cloud = SplatCloud()
+    cloud.append(Splat(position: SIMD3<Float>(-0.05, 0.0, 2.1),
+                       logScale: SIMD3<Float>(repeating: logf(0.22)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1),
+                       opacityLogit: 0.5, color: SIMD3<Float>(repeating: 0.5)))
+    cloud.append(Splat(position: SIMD3<Float>(0.06, 0.0, 2.1),
+                       logScale: SIMD3<Float>(repeating: logf(0.22)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1),
+                       opacityLogit: 0.5, color: SIMD3<Float>(repeating: 0.5)))
+
+    func totalLoss(_ c: SplatCloud) -> Double {
+        var sum = 0.0
+        for (pose, reference) in zip(poses, references) {
+            let image = SplatRasterizer.render(cloud: c, pose: pose, intrinsics: intrinsics,
+                                               width: width, height: height, background: background)
+            sum += SplatRasterizer.meanAbsoluteError(image, reference: reference)
+        }
+        return sum / Double(poses.count)
+    }
+
+    var opts = OptimizerOptions()
+    opts.scaleToScene(extent: SplatOptimizer.sceneExtent(of: cloud))
+    // Faster rates than production defaults: this is a 2-splat toy that must
+    // converge in a handful of iterations inside a test suite, not a scene.
+    opts.colorLR = 0.05; opts.opacityLR = 0.2; opts.scaleLR = 0.02
+    opts.positionLR = max(opts.positionLR, 0.002)
+    let optimizer = SplatOptimizer(splatCount: cloud.count, options: opts)
+
+    let startLoss = totalLoss(cloud)
+    var lossHistory: [Double] = [startLoss]
+    for _ in 0..<60 {
+        var accumulated = SplatGradients(count: cloud.count)
+        for (pose, reference) in zip(poses, references) {
+            let (_, g) = SplatBackward.lossAndGradients(
+                cloud: cloud, pose: pose, intrinsics: intrinsics,
+                width: width, height: height, reference: reference, background: background)
+            accumulated.add(g)
+        }
+        optimizer.apply(gradients: accumulated, to: &cloud)
+        lossHistory.append(totalLoss(cloud))
+    }
+    let endLoss = lossHistory.last!
+    print(String(format: "      loss %.5f -> %.5f over 60 iterations (%.0f%% reduction)",
+                 startLoss, endLoss, (1 - endLoss / startLoss) * 100))
+    expect(endLoss < startLoss * 0.6,
+           "training reduces loss substantially (\(startLoss) -> \(endLoss))")
+    // Monotone-ish: allow occasional uphill steps (Adam momentum overshoots)
+    // but the trend must be down.
+    let firstHalf = lossHistory[0..<30].reduce(0, +) / 30
+    let secondHalf = lossHistory[30...].reduce(0, +) / Double(lossHistory[30...].count)
+    expect(secondHalf < firstHalf, "loss trend is downward, not oscillating")
+
+    // The learned parameters must move TOWARD the truth, not merely reduce loss
+    // by some other route (e.g. blurring everything to the mean colour).
+    expect(cloud.colors[0].x > 0.6 || cloud.colors[1].x > 0.6,
+           "a splat learns the red target colour (\(cloud.colors[0].x), \(cloud.colors[1].x))")
+    expect(cloud.colors[0].y > 0.5 || cloud.colors[1].y > 0.5,
+           "a splat learns the green target colour (\(cloud.colors[0].y), \(cloud.colors[1].y))")
+    expect(cloud.opacityLogits.allSatisfy { $0 > 0.5 },
+           "opacity rises toward the opaque target")
+    expect(cloud.rotations.allSatisfy { abs(SplatMath.normalizeQuaternion($0).w) > 0.5 },
+           "quaternions stay normalised and near identity")
+}
+
+print("Adaptive density control:")
+do {
+    var cloud = SplatCloud()
+    // 0: small, high gradient      -> clone
+    // 1: large, high gradient      -> split into 2
+    // 2: low opacity               -> prune
+    // 3: quiet and healthy         -> untouched
+    cloud.append(Splat(position: SIMD3<Float>(0, 0, 2), logScale: SIMD3<Float>(repeating: logf(0.001)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 2, color: SIMD3<Float>(1, 0, 0)))
+    cloud.append(Splat(position: SIMD3<Float>(1, 0, 2), logScale: SIMD3<Float>(repeating: logf(0.5)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 2, color: SIMD3<Float>(0, 1, 0)))
+    cloud.append(Splat(position: SIMD3<Float>(2, 0, 2), logScale: SIMD3<Float>(repeating: logf(0.01)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: -8, color: SIMD3<Float>(0, 0, 1)))
+    cloud.append(Splat(position: SIMD3<Float>(3, 0, 2), logScale: SIMD3<Float>(repeating: logf(0.01)),
+                       rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: 2, color: SIMD3<Float>(1, 1, 0)))
+
+    var gradients = SplatGradients(count: cloud.count)
+    gradients.screenGradient = [1.0, 1.0, 0.0, 0.0]      // splats 0 and 1 are being pulled
+    gradients.visibleCount = [1, 1, 1, 1]
+
+    let optimizer = SplatOptimizer(splatCount: cloud.count)
+    let extent = SplatOptimizer.sceneExtent(of: cloud)
+    var density = DensityOptions()
+    // sizeThreshold must stay well BELOW maxWorldSize, and the gap is
+    // load-bearing. Splitting is triggered above sizeThreshold; pruning removes
+    // anything above maxWorldSize. Set equal, every splat large enough to split
+    // is also large enough to prune, so a split is immediately undone and its
+    // children discarded in the same pass — measured here as 4 pruned instead
+    // of the expected 2. The defaults (0.01 vs 0.1) leave a 10x band where a
+    // splat can be refined instead of deleted.
+    density.sizeThreshold = 0.02
+    density.maxWorldSize = 0.5
+    let report = optimizer.densifyAndPrune(cloud: &cloud, gradients: gradients,
+                                           sceneExtent: extent, options: density)
+    print("      cloned \(report.cloned), split \(report.split), pruned \(report.pruned), final \(report.finalCount)")
+    expect(report.cloned == 1, "the small high-gradient splat is cloned (got \(report.cloned))")
+    expect(report.split == 1, "the large high-gradient splat is split (got \(report.split))")
+    expect(report.pruned >= 1, "the transparent splat is pruned (got \(report.pruned))")
+    // 4 originals + 1 clone + 2 children - 1 parent - 1 transparent = 5
+    expect(cloud.count == report.finalCount, "reported count matches the cloud")
+    expect(cloud.opacityLogits.allSatisfy { 1 / (1 + expf(-$0)) >= density.minOpacity },
+           "no invisible splats survive pruning")
+
+    // Split children must survive, be smaller than the parent, and sit near it.
+    let children = (0..<cloud.count).filter { abs(cloud.positions[$0].x - 1) < 1.0 }
+    expect(children.count == 2, "the split leaves exactly two children (got \(children.count))")
+    expect(children.allSatisfy { cloud[$0].scale.x < 0.5 },
+           "split children are smaller than the 0.5-scale parent")
+    expect(!cloud.positions.contains { $0.x == 1 && cloud[0].scale.x == 0.5 },
+           "the split parent itself is gone")
+
+    // A step after densification must not crash or corrupt state: this is where
+    // Adam moments and the cloud can silently fall out of alignment.
+    var zero = SplatGradients(count: cloud.count)
+    zero.screenGradient = Array(repeating: 0, count: cloud.count)
+    zero.visibleCount = Array(repeating: 1, count: cloud.count)
+    let before = cloud.count
+    optimizer.apply(gradients: zero, to: &cloud)
+    expect(cloud.count == before, "optimizer state survives densification (\(before) -> \(cloud.count))")
+
+    // Opacity reset must lower, never raise.
+    var resettable = cloud
+    let highest = resettable.opacityLogits.max() ?? 0
+    optimizer.resetOpacity(cloud: &resettable)
+    expect((resettable.opacityLogits.max() ?? 0) < highest, "opacity reset lowers the maximum")
+    expect(zip(cloud.opacityLogits, resettable.opacityLogits).allSatisfy { $1 <= $0 },
+           "opacity reset never raises any splat")
+
+    // Pruning everything must be refused rather than ending training.
+    var doomed = SplatCloud()
+    doomed.append(Splat(position: .zero, logScale: SIMD3<Float>(repeating: logf(0.01)),
+                        rotation: SIMD4<Float>(0, 0, 0, 1), opacityLogit: -20, color: .zero))
+    let doomedOptimizer = SplatOptimizer(splatCount: doomed.count)
+    var noGradients = SplatGradients(count: doomed.count)
+    noGradients.visibleCount = [1]
+    _ = doomedOptimizer.densifyAndPrune(cloud: &doomed, gradients: noGradients, sceneExtent: 1)
+    expect(doomed.count >= 1, "pruning refuses to empty the scene")
+}
+
 print("\n\(passed) passed, \(failures) failed")
 exit(failures == 0 ? 0 : 1)
